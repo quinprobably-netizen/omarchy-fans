@@ -4,6 +4,7 @@
 #
 #   ./install.sh            build + install everything
 #   ./install.sh --plugin   only (re)install the shell plugin
+#   ./install.sh --it87-dkms  Gigabyte boards: install frankcrawford/it87 (fan control fix)
 #   ./install.sh --uninstall
 set -euo pipefail
 src="$(cd "$(dirname "$0")" && pwd)"
@@ -29,8 +30,12 @@ install_plugin() {
 
 case "${1:-}" in
   "") ;;
-  -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   --plugin) install_plugin; exit 0 ;;
+  --it87-dkms)
+    as_root "$src/system/install-it87-dkms.sh"
+    echo "Now recalibrate: omarchy-fans calibrate"
+    exit 0 ;;
   --uninstall)
     as_root "$src/system/uninstall-system.sh"
     omarchy plugin disable qqq.fans 2>/dev/null || true

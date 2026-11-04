@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub const KICK_SECONDS: f64 = 2.0;
+pub const UNRESPONSIVE_MSG: &str = "Some fans ignore PWM with this driver and stay under BIOS control. \
+On Gigabyte boards install the frankcrawford/it87 driver (see README), then recalibrate.";
 pub const STALL_SECONDS: f64 = 6.0;
 
 /// Set from the SIGTERM/SIGINT handler in the daemon binary.
@@ -287,10 +289,16 @@ impl Core {
             return;
         }
         for i in 0..self.fans.len() {
-            if !self.fans[i].cfg.enabled || !self.fans[i].connected() {
+            if !self.fans[i].cfg.enabled || !self.fans[i].controllable() {
                 let f = &mut self.fans[i];
                 (f.stalled, f.stall_since, f.target) = (false, None, 0.0);
-                f.reason = if f.cfg.enabled { "no fan".into() } else { "disabled".into() };
+                f.reason = if !f.cfg.enabled {
+                    "disabled".into()
+                } else if !f.connected() {
+                    "no fan".into()
+                } else {
+                    "not controllable (BIOS)".into()
+                };
                 continue;
             }
             if let Err(e) = self.control_fan(i, &prof, critical.as_deref(), dt, now) {
@@ -597,6 +605,8 @@ impl Daemon {
             let _ = fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o755));
             if core.fans.is_empty() {
                 core.message = "No controllable fans found (is the it87 module loaded?)".into();
+            } else if core.fans.iter().any(|f| f.connected() && !f.responsive()) {
+                core.message = UNRESPONSIVE_MSG.into();
             } else if !core.fans.iter().any(Fan::calibrated) {
                 core.message = "Fans not calibrated yet: run Calibrate for quieter, RPM-accurate curves".into();
             }

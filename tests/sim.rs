@@ -109,6 +109,10 @@ impl FakeHw {
                         let rpm = rpm_for(&mut spinning.lock().unwrap(), i, p);
                         w(&it.join(format!("fan{n}_input")), rpm);
                     }
+                    // Header 4: a fan the driver cannot steer (as on Gigabyte
+                    // boards under mainline it87). RPM wanders, ignores PWM.
+                    let wobble = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() / 700 % 7) as i64;
+                    w(&it.join("fan4_input"), 1140 + wobble * 15);
                     thread::sleep(Duration::from_millis(2));
                 }
             })
@@ -398,10 +402,12 @@ fn calibration_measures_fans() {
     let rig = Rig::new();
     rig.calibrate();
     let core = rig.d.lock();
-    assert_eq!(core.message, "Calibration complete");
     let f = &core.fans;
     assert!(f[0].connected() && f[1].connected() && f[2].connected());
-    assert!(!f[3].connected() && !f[4].connected(), "empty headers must be detected");
+    assert!(!f[4].connected(), "empty header must be detected");
+    assert!(f[3].connected() && !f[3].responsive(), "PWM-deaf fan must be flagged");
+    assert!(f[0].responsive() && f[1].responsive() && f[2].responsive());
+    assert!(core.message.contains("ignore PWM"), "{}", core.message);
     let c1 = f[0].cfg.calibration.as_ref().unwrap();
     // fan 1 stops below 40 and restarts at 70: floor above stop, kick above start
     assert_eq!(c1.stop_pwm, Some(30));
@@ -433,8 +439,10 @@ fn disconnected_fans_left_to_firmware() {
     let rig = Rig::new();
     rig.calibrate();
     rig.ticks(3, 50_000.0);
-    assert_eq!(rig.hw.enable(4), 2);
+    assert_eq!(rig.hw.enable(5), 2, "empty header back to firmware");
+    assert_eq!(rig.hw.enable(4), 2, "uncontrollable fan back to firmware");
     assert_eq!(rig.hw.enable(1), 1);
+    assert!(rig.fan(3, |f| f.reason.contains("not controllable")));
 }
 
 #[test]
@@ -465,5 +473,5 @@ fn empty_headers_never_flag_stall() {
     let rig = Rig::new();
     rig.ticks(20, 1000.0);
     assert!(rig.fan(0, |f| f.seen_spinning));
-    assert!(!rig.fan(3, |f| f.seen_spinning || f.stalled), "empty header pwm4 must not report a stall");
+    assert!(!rig.fan(4, |f| f.seen_spinning || f.stalled), "empty header pwm5 must not report a stall");
 }

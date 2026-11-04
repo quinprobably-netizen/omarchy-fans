@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 pub const DEFAULT_FLOOR_PWM: i64 = 70;
 
 /// Measured response of one fan, produced by calibration.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Calibration {
     /// Unix seconds.
@@ -25,6 +25,30 @@ pub struct Calibration {
     /// Lowest duty used in normal operation (stop point plus margin).
     pub floor_pwm: Option<i64>,
     pub min_rpm: Option<f64>,
+    /// RPM actually follows PWM. False when the driver's writes have no
+    /// effect (e.g. Gigabyte boards where mainline it87 cannot take control).
+    #[serde(default = "yes")]
+    pub responsive: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Calibration {
+            at: 0,
+            max_rpm: 0,
+            connected: false,
+            table: Vec::new(),
+            stop_pwm: None,
+            start_pwm: None,
+            floor_pwm: None,
+            min_rpm: None,
+            responsive: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -90,6 +114,16 @@ impl Fan {
         self.cfg.calibration.as_ref().is_none_or(|c| c.connected)
     }
 
+    /// Calibration found that PWM writes do not change this fan's speed.
+    pub fn responsive(&self) -> bool {
+        self.cfg.calibration.as_ref().is_none_or(|c| c.responsive)
+    }
+
+    /// Present and actually steerable: the only fans the control loop drives.
+    pub fn controllable(&self) -> bool {
+        self.connected() && self.responsive()
+    }
+
     pub fn calibrated(&self) -> bool {
         self.cfg.calibration.as_ref().is_some_and(|c| !c.table.is_empty())
     }
@@ -139,6 +173,7 @@ impl Fan {
             "role": self.cfg.role,
             "enabled": self.cfg.enabled,
             "connected": self.connected(),
+            "responsive": self.responsive(),
             "calibrated": self.calibrated(),
             "allow_stop": self.cfg.allow_stop,
             "rpm": self.rpm,

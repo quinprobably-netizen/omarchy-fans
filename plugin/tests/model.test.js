@@ -78,3 +78,8 @@ test("never-spinning uncalibrated headers are hidden", () => {
   const st = { ...status, fans: [...status.fans, { id: "it8689/pwm5", label: "x", role: "case", connected: true, calibrated: false, seen_spinning: false, rpm: 0 }] }
   assert.deepEqual(M.connectedFans(st).map(f => f.id), ["it8689/pwm1", "it8689/pwm2"])
 })
+
+test("PWM-deaf fans stay listed (they still report RPM)", () => {
+  const st = { ...status, fans: [{ id: "it8689/pwm2", label: "S", role: "case", connected: true, calibrated: true, responsive: false, rpm: 1149 }] }
+  assert.equal(M.connectedFans(st).length, 1)
+})

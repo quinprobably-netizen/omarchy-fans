@@ -169,7 +169,8 @@ fn run(d: &Daemon, idxs: &[usize]) {
             for (&i, r) in idxs.iter().zip(&results) {
                 core.fans[i].cfg.calibration = Some(summarise(r.table.clone(), r.stop_pwm, r.start_pwm));
             }
-            core.message = "Calibration complete".into();
+            let stuck = idxs.iter().any(|&i| core.fans[i].connected() && !core.fans[i].responsive());
+            core.message = if stuck { crate::daemon::UNRESPONSIVE_MSG.into() } else { "Calibration complete".into() };
         }
         Err(e) => {
             eprintln!("warning: calibration aborted: {e}");
@@ -180,7 +181,7 @@ fn run(d: &Daemon, idxs: &[usize]) {
     for &i in idxs {
         core.fans[i].percent = None;
         core.fans[i].written_pwm = None;
-        if curve_mode && core.fans[i].connected() {
+        if curve_mode && core.fans[i].controllable() {
             // Full speed until the next tick puts it back on its curve.
             let _ = core.set_pwm(i, 255);
         } else {
@@ -211,6 +212,16 @@ pub fn summarise(table: BTreeMap<i64, i64>, stop_pwm: Option<i64>, start_pwm: Op
             [p as f64, best as f64]
         })
         .collect();
+    // Does speed follow duty at all? Compare full duty with the slowest
+    // spinning duty at or below half. Real fans differ by well over 2x;
+    // under 15% means the writes are not reaching the fan.
+    let slowest = table.iter().filter(|(p, rpm)| **p <= 128 && **rpm > 0).map(|(_, r)| *r).min();
+    let full = table.get(&255).copied().unwrap_or(max_rpm);
+    if stop_pwm.is_none() && slowest.is_some_and(|s| ((full - s) as f64) < 0.15 * full as f64) {
+        cal.responsive = false;
+        cal.table = table.iter().map(|(&p, &r)| [p as f64, r as f64]).collect();
+        return cal;
+    }
     let lowest_spin = table.iter().find(|(_, rpm)| **rpm > 0).map(|(p, _)| *p).unwrap_or(0);
     // Margin above the lowest duty that held rotation, so wear, dust and
     // temperature drift never stall the fan in normal operation.
@@ -253,6 +264,19 @@ mod tests {
         let cal = summarise([(0, 300), (128, 900), (255, 1200)].into(), None, None);
         assert_eq!(cal.floor_pwm, Some(0));
         assert_eq!(cal.start_pwm, Some(0));
+    }
+
+    #[test]
+    fn flat_response_is_unresponsive() {
+        // Measured on the B650M D3HP with mainline it87: duty does nothing.
+        let flat = [(0, 1240), (20, 1245), (50, 1132), (90, 1163), (105, 1245), (160, 1130), (205, 1169), (255, 1243)];
+        let cal = summarise(flat.into(), None, None);
+        assert!(cal.connected && !cal.responsive);
+        let flat2 = [(0, 1149), (50, 1147), (128, 1151), (255, 1147)];
+        assert!(!summarise(flat2.into(), None, None).responsive);
+        // A never-stopping fan with a real (if limited) range stays responsive.
+        let real = [(0, 300), (128, 900), (255, 1200)];
+        assert!(summarise(real.into(), None, None).responsive);
     }
 
     #[test]

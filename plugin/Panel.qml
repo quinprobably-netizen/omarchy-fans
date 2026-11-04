@@ -344,7 +344,8 @@ Panel {
               Text {
                 id: fanName
                 textFormat: Text.PlainText
-                text: modelData.label + (modelData.calibrated ? "" : "  ·  uncalibrated")
+                text: modelData.label + (modelData.responsive === false ? "  ·  BIOS (driver can't steer)"
+                  : (modelData.calibrated ? "" : "  ·  uncalibrated"))
                 color: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall

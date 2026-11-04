@@ -25,6 +25,22 @@ The installer:
 
 It does not enable the service if no PWM fans are detected.
 
+### Gigabyte boards: fans that ignore PWM
+
+On this B650M D3HP the mainline `it87` driver binds the IT8689E (rev 2) and accepts PWM writes, but the fans don't follow them. Gigabyte's firmware programs extra SmartFan "vectors" in register banks 2 and 3. These keep driving the fans from temperature even when a channel is in manual mode. Calibration detects this: an affected fan is marked **BIOS (driver can't steer)** and left to the firmware.
+
+Fix it with the out-of-tree driver, which disables those vectors and uses MMIO:
+
+```sh
+./install.sh --it87-dkms   # pacman dkms + frankcrawford/it87 via DKMS, swaps the module
+omarchy-fans calibrate
+```
+
+Measured with mainline it87, duty 255 down to 0:
+- CPU fan: 1128–1247 RPM, tracking CPU temperature
+- System fan 1: flat at ~1149 RPM
+- System fan 2: 1175 RPM, then 864 RPM at duty 205 and below
+
 ## How the curves are optimised
 
 Each tick (1 s), the daemon processes each temperature in this order:

@@ -30,5 +30,6 @@ if [[ $fans -eq 0 ]]; then
   exit 2
 fi
 echo "Detected $fans PWM channels."
-systemctl enable --now omarchy-fand.service
+systemctl enable omarchy-fand.service
+systemctl restart omarchy-fand.service  # picks up a new binary on reinstall
 systemctl --no-pager --lines=5 status omarchy-fand.service || true
