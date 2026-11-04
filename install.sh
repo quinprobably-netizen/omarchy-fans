@@ -20,7 +20,11 @@ as_root() {
 install_plugin() {
   [[ -L $plugin_dir ]] && rm "$plugin_dir"
   mkdir -p "$plugin_dir"
-  cp "$src"/plugin/{manifest.json,Panel.qml,CurveEditor.qml,Model.js} "$plugin_dir/"
+  # Copy then rename: the shell's hot-reload watcher reacts to new files
+  # landing in the directory, not to in-place overwrites.
+  for f in manifest.json Panel.qml CurveEditor.qml Model.js; do
+    cp "$src/plugin/$f" "$plugin_dir/.$f.new" && mv -f "$plugin_dir/.$f.new" "$plugin_dir/$f"
+  done
   omarchy plugin validate "$plugin_dir"
   if ! omarchy plugin list --json | jq -e '.[] | select(.id == "qqq.fans" and .enabled)' >/dev/null; then
     omarchy plugin enable qqq.fans --section right
