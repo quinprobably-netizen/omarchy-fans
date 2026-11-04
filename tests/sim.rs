@@ -407,7 +407,7 @@ fn calibration_measures_fans() {
     assert!(!f[4].connected(), "empty header must be detected");
     assert!(f[3].connected() && !f[3].responsive(), "PWM-deaf fan must be flagged");
     assert!(f[0].responsive() && f[1].responsive() && f[2].responsive());
-    assert!(core.message.contains("ignore PWM"), "{}", core.message);
+    assert!(core.message.contains("System fan 3 ignores PWM"), "{}", core.message);
     let c1 = f[0].cfg.calibration.as_ref().unwrap();
     // fan 1 stops below 40 and restarts at 70: floor above stop, kick above start
     assert_eq!(c1.stop_pwm, Some(30));
@@ -455,8 +455,14 @@ fn kicks_fan_from_rest() {
     let t = rig.ticks(200, 60_000.0);
     assert_eq!(rig.hw.pwm(1), 0, "silent + allow_stop rests the fan when cold");
     rig.hw.cpu(65.0);
-    rig.ticks(6, t);
-    assert!(rig.hw.pwm(1) >= rig.fan(0, |f| f.start_pwm()));
+    // The first tick that leaves rest must kick at the start duty, whatever
+    // the fan settles at once the kick expires.
+    let first_spin = (0..10).find_map(|k| {
+        rig.d.tick(t + k as f64);
+        let p = rig.hw.pwm(1);
+        (p > 0).then_some(p)
+    });
+    assert!(first_spin.unwrap() >= rig.fan(0, |f| f.start_pwm()), "{first_spin:?}");
 }
 
 #[test]

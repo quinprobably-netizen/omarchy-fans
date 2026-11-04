@@ -33,8 +33,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub const KICK_SECONDS: f64 = 2.0;
-pub const UNRESPONSIVE_MSG: &str = "Some fans ignore PWM with this driver and stay under BIOS control. \
-On Gigabyte boards install the frankcrawford/it87 driver (see README), then recalibrate.";
+/// Status line for fans whose speed ignores PWM, naming them.
+pub fn unresponsive_message(fans: &[Fan]) -> Option<String> {
+    let names: Vec<&str> = fans.iter().filter(|f| f.connected() && !f.responsive()).map(|f| f.cfg.label.as_str()).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let (list, verb) = if names.len() == 1 { (names[0].to_string(), "ignores") } else { (names.join(", "), "ignore") };
+    Some(format!(
+        "{list} {verb} PWM and stay{s} on BIOS control. A 3-pin fan needs its header in Voltage (DC) mode in the BIOS; \
+         on Gigabyte boards with mainline it87, install the DKMS driver (README). Then recalibrate.",
+        s = if names.len() == 1 { "s" } else { "" }
+    ))
+}
+
 pub const STALL_SECONDS: f64 = 6.0;
 
 /// Set from the SIGTERM/SIGINT handler in the daemon binary.
@@ -605,8 +617,8 @@ impl Daemon {
             let _ = fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o755));
             if core.fans.is_empty() {
                 core.message = "No controllable fans found (is the it87 module loaded?)".into();
-            } else if core.fans.iter().any(|f| f.connected() && !f.responsive()) {
-                core.message = UNRESPONSIVE_MSG.into();
+            } else if let Some(msg) = unresponsive_message(&core.fans) {
+                core.message = msg;
             } else if !core.fans.iter().any(Fan::calibrated) {
                 core.message = "Fans not calibrated yet: run Calibrate for quieter, RPM-accurate curves".into();
             }

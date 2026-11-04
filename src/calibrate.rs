@@ -56,6 +56,18 @@ struct Measured {
     start_pwm: Option<i64>,
 }
 
+impl Measured {
+    /// Record one step of the downward sweep. The first duty that reads
+    /// 0 RPM is the stop point, including duty 0 itself: a fan that only
+    /// stops at 0 still needs a margin above the lowest duty that held it.
+    fn record(&mut self, pwm: i64, rpm: i64) {
+        self.table.insert(pwm, rpm);
+        if rpm == 0 && self.stop_pwm.is_none() && self.table.range(pwm + 1..).any(|(_, &r)| r > 0) {
+            self.stop_pwm = Some(pwm);
+        }
+    }
+}
+
 fn set_all(d: &Daemon, idxs: &[usize], pwm: i64, step: &str) -> Result<(), String> {
     let mut core = d.lock();
     if let Some(c) = core.calibration.as_mut() {
@@ -127,10 +139,7 @@ fn measure(d: &Daemon, idxs: &[usize], results: &mut [Measured]) -> Result<(), S
         wait(d, if pwm < 100 { 4.0 } else { 3.0 }, n / total)?;
         n += 1.0;
         for (r, rpm) in results.iter_mut().zip(rpms(d, idxs)) {
-            r.table.insert(pwm, rpm);
-            if rpm == 0 && pwm > 0 && r.stop_pwm.is_none() {
-                r.stop_pwm = Some(pwm);
-            }
+            r.record(pwm, rpm);
         }
     }
     // Start test: fans that stopped at 0 and spin at 255 are at rest now.
@@ -169,8 +178,8 @@ fn run(d: &Daemon, idxs: &[usize]) {
             for (&i, r) in idxs.iter().zip(&results) {
                 core.fans[i].cfg.calibration = Some(summarise(r.table.clone(), r.stop_pwm, r.start_pwm));
             }
-            let stuck = idxs.iter().any(|&i| core.fans[i].connected() && !core.fans[i].responsive());
-            core.message = if stuck { crate::daemon::UNRESPONSIVE_MSG.into() } else { "Calibration complete".into() };
+            core.message = crate::daemon::unresponsive_message(&core.fans)
+                .map_or("Calibration complete".into(), |m| format!("Calibration complete. {m}"));
         }
         Err(e) => {
             eprintln!("warning: calibration aborted: {e}");
@@ -277,6 +286,28 @@ mod tests {
         // A never-stopping fan with a real (if limited) range stays responsive.
         let real = [(0, 300), (128, 900), (255, 1200)];
         assert!(summarise(real.into(), None, None).responsive);
+    }
+
+    #[test]
+    fn sweep_records_stop_point_including_zero() {
+        let sweep = |pts: &[(i64, i64)]| {
+            let mut m = Measured::default();
+            pts.iter().for_each(|&(p, r)| m.record(p, r));
+            m.stop_pwm
+        };
+        assert_eq!(sweep(&[(255, 1436), (40, 333), (20, 202), (0, 0)]), Some(0));
+        assert_eq!(sweep(&[(255, 1800), (40, 500), (30, 0), (20, 0), (0, 0)]), Some(30));
+        assert_eq!(sweep(&[(255, 1200), (0, 300)]), None, "never stops");
+        assert_eq!(sweep(&[(255, 0), (0, 0)]), None, "empty header has no stop point");
+    }
+
+    #[test]
+    fn fan_that_only_stops_at_zero_still_gets_a_margin() {
+        // System fan 2 on the B650M D3HP (frankcrawford it87): spins at duty 20.
+        let t = [(0, 0), (20, 202), (30, 254), (40, 333), (90, 753), (255, 1436)];
+        let cal = summarise(t.into(), Some(0), Some(40));
+        assert_eq!(cal.stop_pwm, Some(0));
+        assert_eq!(cal.floor_pwm, Some(35));
     }
 
     #[test]
