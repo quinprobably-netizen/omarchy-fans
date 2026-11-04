@@ -1,0 +1,31 @@
+[Unit]
+Description=Omarchy fan curve daemon
+Documentation=file:///usr/local/share/doc/omarchy-fans/README.md
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/modprobe it87
+ExecStart=/usr/local/bin/omarchy-fand run
+# However the daemon exits (even SIGKILL), hand the fans back to the BIOS.
+ExecStopPost=/usr/local/bin/omarchy-fand restore
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=omarchy-fans
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+StateDirectory=omarchy-fans
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

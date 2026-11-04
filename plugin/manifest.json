@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "qqq.fans",
+  "name": "Fans",
+  "version": "0.1.0",
+  "author": "qqq",
+  "license": "MIT",
+  "description": "Fan curves for motherboard PWM fans, driven by the omarchy-fand daemon.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Fans",
+    "description": "Fan speeds, temperatures, profiles and an editable fan curve.",
+    "category": "System",
+    "aliases": ["fan", "fancontrol", "cooling"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barMode": "RPM",
+      "command": "omarchy-fans"
+    },
+    "schema": [
+      { "key": "barMode", "type": "enum", "label": "Bar display", "options": ["RPM", "Temp", "Icon"], "defaultValue": "RPM" },
+      { "key": "command", "type": "string", "label": "CLI command", "defaultValue": "omarchy-fans", "description": "Path to the omarchy-fans CLI." }
+    ]
+  }
+}

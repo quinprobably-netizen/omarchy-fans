@@ -1,0 +1,17 @@
+[package]
+name = "omarchy-fans"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fan-curve daemon, CLI and Omarchy shell plugin for hwmon PWM fans"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "unwind"
