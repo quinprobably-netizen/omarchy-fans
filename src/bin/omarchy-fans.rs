@@ -20,6 +20,9 @@ const HELP: &str = "omarchy-fans: control the omarchy-fand fan-curve daemon
   omarchy-fans fan <id> [--label L] [--role cpu|case] [--enable|--disable]
                         [--allow-stop|--no-stop]
   omarchy-fans calibrate [fan-id ...]  measure fan RPM/PWM response (~2 min)
+  omarchy-fans retest [fan-id ...]   check fans that ignored PWM again (e.g. after
+                                     switching a 3-pin fan's header to Voltage mode
+                                     in the BIOS); calibrates any that respond now
   omarchy-fans auto                  hand fans back to the BIOS curve
   omarchy-fans resume                take control again with the active profile
   omarchy-fans rescan                re-detect sensors and fans";
@@ -85,7 +88,8 @@ fn summary(st: &Value) -> String {
         .filter_map(|f| f["rpm"].as_i64().map(|r| r.to_string()))
         .collect();
     let mode = if !st["calibration"].is_null() {
-        format!("calibrating {:.0}%", num(&st["calibration"]["progress"]).unwrap_or(0.0) * 100.0)
+        let verb = if st["calibration"]["kind"] == "retest" { "re-testing" } else { "calibrating" };
+        format!("{verb} {:.0}%", num(&st["calibration"]["progress"]).unwrap_or(0.0) * 100.0)
     } else if st["mode"] == "auto" {
         "BIOS".into()
     } else {
@@ -121,7 +125,8 @@ fn show(st: &Value) {
         let mut flags = Vec::new();
         if f["connected"] != json!(true) { flags.push("not connected") }
         if f["enabled"] != json!(true) { flags.push("disabled") }
-        if f["calibrated"] != json!(true) && f["connected"] == json!(true) { flags.push("uncalibrated") }
+        if f["kind"] == "gpu" { flags.push("GPU, PCODE fan table") }
+        else if f["calibrated"] != json!(true) && f["connected"] == json!(true) { flags.push("uncalibrated") }
         if f["stalled"] == json!(true) { flags.push("STALLED") }
         let pct = num(&f["percent"]).map_or("    —".into(), |p| format!("{p:5.1}%"));
         let pwm = f["pwm"].as_i64().map_or("—".into(), |p| p.to_string());
@@ -242,6 +247,11 @@ fn main() {
             let fans = if rest.is_empty() { Value::Null } else { json!(rest) };
             call(json!({"cmd": "calibrate", "fans": fans}));
             println!("calibration started (~2 min); follow with: omarchy-fans status");
+        }
+        "retest" => {
+            let fans = if rest.is_empty() { Value::Null } else { json!(rest) };
+            call(json!({"cmd": "retest", "fans": fans}));
+            println!("re-test started (~15 s, ~2 min more if a fan responds); follow with: omarchy-fans status");
         }
         "auto" => {
             call(json!({"cmd": "mode", "mode": "auto"}));

@@ -16,6 +16,7 @@
 use crate::calibrate;
 use crate::curve::{self, interp, Point};
 use crate::fan::{Fan, FanConfig};
+use crate::gpufan::{self, GpuFan};
 use crate::hwmon::Hwmon;
 use crate::profiles::{self, Profile, PROFILE_ORDER, ROLES};
 use crate::sensor::{self, Sensor, SENSOR_IDS};
@@ -41,8 +42,8 @@ pub fn unresponsive_message(fans: &[Fan]) -> Option<String> {
     }
     let (list, verb) = if names.len() == 1 { (names[0].to_string(), "ignores") } else { (names.join(", "), "ignore") };
     Some(format!(
-        "{list} {verb} PWM and stay{s} on BIOS control. A 3-pin fan needs its header in Voltage (DC) mode in the BIOS; \
-         on Gigabyte boards with mainline it87, install the DKMS driver (README). Then recalibrate.",
+        "{list} {verb} PWM and stay{s} on BIOS control: a 3-pin fan needs its header in Voltage mode in the BIOS \
+         (Gigabyte with mainline it87: also install the DKMS driver, see README). Re-tested at every daemon start.",
         s = if names.len() == 1 { "s" } else { "" }
     ))
 }
@@ -59,6 +60,9 @@ pub struct Paths {
     pub state_dir: PathBuf,
     /// Group allowed to use the control socket.
     pub group: String,
+    /// PCI driver directory scanned for Arc A-series cards
+    /// (/sys/bus/pci/drivers/xe).
+    pub pci_xe: PathBuf,
 }
 
 impl Paths {
@@ -111,6 +115,8 @@ impl Default for State {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CalProgress {
+    /// "calibrate" or "retest".
+    pub kind: String,
     pub step: String,
     pub progress: f64,
     pub fans: Vec<String>,
@@ -157,6 +163,12 @@ impl Core {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         state.custom.label = "Custom".into();
+        // Custom profiles saved before GPU fan support get the default GPU curve.
+        if !state.custom.curves.contains_key("gpu")
+            && let Some(c) = profiles::default_custom().curves.get("gpu")
+        {
+            state.custom.curves.insert("gpu".into(), c.clone());
+        }
         if !PROFILE_ORDER.contains(&state.profile.as_str()) {
             state.profile = "balanced".into();
         }
@@ -217,6 +229,19 @@ impl Core {
                 Fan::new(ch.chip, ch.pwm, ch.fan, cfg)
             })
             .collect();
+        for pci in gpufan::discover(&self.paths.pci_xe) {
+            let chip = self.hw.chip_for_device(&pci, "xe");
+            let gpu = GpuFan::new(pci);
+            let probe = Fan::new_gpu(GpuFan::new(gpu.pci.clone()), chip.clone(), FanConfig::default());
+            let cfg = self.state.fans.get(&probe.id).cloned().unwrap_or_else(|| FanConfig {
+                label: "GPU fan".into(),
+                role: "gpu".into(),
+                // Like the stock firmware curve: silent when the card is cool.
+                allow_stop: true,
+                ..FanConfig::default()
+            });
+            self.fans.push(Fan::new_gpu(gpu, chip, cfg));
+        }
     }
 
     pub fn sensor(&self, id: &str) -> Option<&Sensor> {
@@ -230,6 +255,11 @@ impl Core {
         let value = value.clamp(0, 255);
         let hw = &self.hw;
         let fan = &mut self.fans[idx];
+        if let Some(g) = fan.gpu.as_mut() {
+            g.set(gpufan::pct_for_pwm(value))?;
+            fan.written_pwm = Some(value);
+            return Ok(());
+        }
         if fan.written_pwm == Some(value) {
             return Ok(());
         }
@@ -257,6 +287,16 @@ impl Core {
     pub fn release(&mut self, idx: usize) {
         let hw = &self.hw;
         let fan = &mut self.fans[idx];
+        if let Some(g) = fan.gpu.as_mut() {
+            if fan.written_pwm.is_some()
+                && let Err(e) = g.release()
+            {
+                eprintln!("error: could not release {}: {e}", fan.id);
+            }
+            fan.written_pwm = None;
+            fan.percent = None;
+            return;
+        }
         let enable = format!("{}_enable", fan.pwm);
         let mode = fan.original_enable.unwrap_or(2);
         if hw.read(&fan.chip, &enable) == Some(1) && hw.write(&fan.chip, &enable, mode).is_err() {
@@ -297,10 +337,16 @@ impl Core {
             fan.rpm = fan.rpm_attr.as_ref().and_then(|a| self.hw.read(&fan.chip, &format!("{a}_input")));
             fan.seen_spinning |= fan.rpm.is_some_and(|r| r > 0);
         }
-        if self.calibration.is_some() || self.state.mode != "curve" {
+        if self.state.mode != "curve" {
             return;
         }
+        // Fans being calibrated belong to the calibration thread; every
+        // other fan stays on its curve meanwhile.
+        let busy: Vec<String> = self.calibration.as_ref().map(|c| c.fans.clone()).unwrap_or_default();
         for i in 0..self.fans.len() {
+            if busy.contains(&self.fans[i].id) {
+                continue;
+            }
             if !self.fans[i].cfg.enabled || !self.fans[i].controllable() {
                 let f = &mut self.fans[i];
                 (f.stalled, f.stall_since, f.target) = (false, None, 0.0);
@@ -309,7 +355,7 @@ impl Core {
                 } else if !f.connected() {
                     "no fan".into()
                 } else {
-                    "not controllable (BIOS)".into()
+                    "not controllable: ignores PWM (BIOS)".into()
                 };
                 continue;
             }
@@ -565,6 +611,11 @@ impl Daemon {
             calibrate::start(self, ids)?;
             return Ok(json!({"calibrating": true}));
         }
+        if req.get("cmd").and_then(Value::as_str) == Some("retest") {
+            let ids: Option<Vec<String>> = req.get("fans").and_then(|v| serde_json::from_value(v.clone()).ok());
+            calibrate::start_retest(self, ids)?;
+            return Ok(json!({"retesting": true}));
+        }
         self.lock().handle(req)
     }
 
@@ -631,6 +682,18 @@ impl Daemon {
                 core.sensors.iter().map(|s| format!("{}={}/{}", s.id, s.chip, s.attr)).collect::<Vec<_>>().join(", "),
             );
         }
+        // A BIOS change (header to Voltage mode) or a driver swap only
+        // happens across a reboot: check PWM-deaf fans again on every start.
+        let retest = {
+            let core = self.lock();
+            core.state.mode == "curve" && core.fans.iter().any(|f| f.cfg.enabled && f.connected() && !f.responsive())
+        };
+        if retest {
+            match calibrate::start_retest(self, None) {
+                Ok(()) => eprintln!("re-testing fans that ignored PWM"),
+                Err(e) => eprintln!("warning: re-test: {e}"),
+            }
+        }
         let d = self.clone();
         std::thread::spawn(move || {
             if let Err(e) = d.serve() {
@@ -660,6 +723,7 @@ impl Daemon {
 /// Hand every PWM channel back to firmware control. Safe to run any time;
 /// systemd runs it after the daemon exits, however it exited.
 pub fn restore(paths: &Paths) {
+    gpufan::restore_all(&paths.pci_xe);
     let hw = Hwmon::new(&paths.sysfs);
     let originals: BTreeMap<String, i64> = fs::read(paths.originals_file())
         .ok()

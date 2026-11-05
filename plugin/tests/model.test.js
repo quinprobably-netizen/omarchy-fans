@@ -83,3 +83,37 @@ test("PWM-deaf fans stay listed (they still report RPM)", () => {
   const st = { ...status, fans: [{ id: "it8689/pwm2", label: "S", role: "case", connected: true, calibrated: true, responsive: false, rpm: 1149 }] }
   assert.equal(M.connectedFans(st).length, 1)
 })
+
+test("PWM-deaf fans get a tag, a fix hint and a re-test state", () => {
+  const deaf = { id: "it/pwm2", label: "System fan 1", connected: true, responsive: false, calibrated: false }
+  const ok = { id: "it/pwm3", connected: true, responsive: true, calibrated: true }
+  const empty = { id: "it/pwm4", connected: false, responsive: true, calibrated: false }
+  assert.equal(M.ignoresPwm(deaf), true)
+  assert.equal(M.ignoresPwm(ok), false)
+  assert.equal(M.ignoresPwm(empty), false)
+  assert.equal(M.fanTag(deaf), "ignores PWM · BIOS")
+  assert.equal(M.fanTag(ok), "")
+  assert.equal(M.fanTag({ connected: true, calibrated: false }), "uncalibrated")
+  assert.match(M.fanHint(deaf), /Voltage mode in the BIOS/)
+  assert.equal(M.fanHint(ok), "")
+  const st = { calibration: { kind: "retest", progress: 0.5, fans: ["it/pwm2"] } }
+  assert.equal(M.retestRunning(st, "it/pwm2"), true)
+  assert.equal(M.retestRunning(st, "it/pwm3"), false)
+  assert.equal(M.retestRunning({ calibration: { kind: "calibrate", fans: ["it/pwm2"] } }, "it/pwm2"), false)
+  assert.equal(M.modeLabel({ ...st, time: 1 }, true), "Re-testing 50%")
+  assert.equal(M.modeLabel({ calibration: { progress: 0.25 } }, true), "Calibrating 25%")
+})
+
+test("GPU fan is listed at rest and gets its own curve tab", () => {
+  const st = {
+    curves: { cpu: { cpu: [[40, 10], [85, 100]] }, gpu: { gpu: [[55, 0], [93, 100]], vram: [[80, 0], [100, 100]] } },
+    sensors: [{ id: "cpu", label: "CPU" }, { id: "gpu", label: "GPU" }, { id: "vram", label: "VRAM" }],
+    fans: [
+      { id: "it/pwm1", role: "cpu", connected: true, calibrated: true, rpm: 800 },
+      { id: "xe/gpu", kind: "gpu", role: "gpu", label: "GPU fan", connected: true, calibrated: false, rpm: 0 },
+    ],
+  }
+  assert.deepEqual(M.connectedFans(st).map(f => f.id), ["it/pwm1", "xe/gpu"])
+  assert.deepEqual(M.curveTabs(st).map(t => t.label), ["CPU fan", "GPU fan", "GPU ← VRAM"])
+  assert.equal(M.fanTag(st.fans[1]), "card")
+})

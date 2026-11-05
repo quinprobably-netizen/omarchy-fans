@@ -14,7 +14,7 @@
 
 use crate::curve::{interp, Point};
 use crate::daemon::{CalProgress, Daemon};
-use crate::fan::Calibration;
+use crate::fan::{Calibration, Fan};
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,31 +22,51 @@ use std::time::{Duration, Instant};
 const STEPS_DOWN: [i64; 17] = [255, 230, 205, 180, 160, 140, 120, 105, 90, 80, 70, 60, 50, 40, 30, 20, 0];
 
 pub fn start(d: &Daemon, ids: Option<Vec<String>>) -> Result<(), String> {
-    let idxs: Vec<usize> = {
-        let mut core = d.lock();
-        if core.calibration.is_some() {
-            return Err("calibration already running".into());
-        }
-        let idxs: Vec<usize> = (0..core.fans.len())
-            .filter(|&i| {
-                let f = &core.fans[i];
-                f.cfg.enabled && ids.as_ref().is_none_or(|ids| ids.iter().any(|id| *id == f.id || *id == f.pwm))
-            })
-            .collect();
-        if idxs.is_empty() {
-            return Err("no fans to calibrate".into());
-        }
-        core.calibration = Some(CalProgress {
-            step: "starting".into(),
-            progress: 0.0,
-            fans: idxs.iter().map(|&i| core.fans[i].id.clone()).collect(),
-        });
-        core.message.clear();
-        idxs
-    };
+    // GPU fans slew too slowly (~50 rpm/s) for the sweep and need no table.
+    let idxs = begin(d, ids.as_deref(), "calibrate", |f| !f.is_gpu())?;
     let d = d.clone();
     thread::spawn(move || run(&d, &idxs));
     Ok(())
+}
+
+/// Re-test fans that calibration found ignoring PWM (a 3-pin fan on a
+/// header in PWM mode, or a driver that cannot take control). A short probe
+/// (full duty, then zero) checks whether the fan follows PWM now, e.g. after
+/// its header was switched to Voltage mode in the BIOS. Fans that do get a
+/// full calibration and go onto their curves; the rest stay with the BIOS.
+/// The daemon runs this at every start.
+pub fn start_retest(d: &Daemon, ids: Option<Vec<String>>) -> Result<(), String> {
+    let idxs = begin(d, ids.as_deref(), "retest", |f| f.connected() && !f.responsive())
+        .map_err(|e| if e == "no fans to retest" { "no fans that ignore PWM to re-test".to_string() } else { e })?;
+    let d = d.clone();
+    thread::spawn(move || run_retest(&d, &idxs));
+    Ok(())
+}
+
+/// Claim the selected, enabled fans for a calibration-style run. Only
+/// these fans leave the control loop; the others stay on their curves.
+fn begin(d: &Daemon, ids: Option<&[String]>, kind: &str, pick: impl Fn(&Fan) -> bool) -> Result<Vec<usize>, String> {
+    let mut core = d.lock();
+    if core.calibration.is_some() {
+        return Err("calibration already running".into());
+    }
+    let idxs: Vec<usize> = (0..core.fans.len())
+        .filter(|&i| {
+            let f = &core.fans[i];
+            f.cfg.enabled && pick(f) && ids.is_none_or(|ids| ids.iter().any(|id| *id == f.id || *id == f.pwm))
+        })
+        .collect();
+    if idxs.is_empty() {
+        return Err(format!("no fans to {kind}"));
+    }
+    core.calibration = Some(CalProgress {
+        kind: kind.into(),
+        step: "starting".into(),
+        progress: 0.0,
+        fans: idxs.iter().map(|&i| core.fans[i].id.clone()).collect(),
+    });
+    core.message.clear();
+    Ok(idxs)
 }
 
 #[derive(Default)]
@@ -169,21 +189,68 @@ fn measure(d: &Daemon, idxs: &[usize], results: &mut [Measured]) -> Result<(), S
     Ok(())
 }
 
+/// Speed must change by this share between full duty and zero for a fan
+/// to count as following PWM (PWM-deaf fans drift by a few percent).
+const FOLLOWS_PWM: f64 = 0.15;
+
+pub fn follows_pwm(full_rpm: i64, zero_rpm: i64) -> bool {
+    full_rpm > 0 && (full_rpm - zero_rpm) as f64 >= FOLLOWS_PWM * full_rpm as f64
+}
+
+/// Full duty, then zero: which of these fans follow PWM?
+fn probe(d: &Daemon, idxs: &[usize]) -> Result<Vec<usize>, String> {
+    set_all(d, idxs, 255, "re-test: full speed")?;
+    wait(d, 6.0, 0.05)?;
+    let full = rpms(d, idxs);
+    set_all(d, idxs, 0, "re-test: zero duty")?;
+    wait(d, 8.0, 0.1)?;
+    let zero = rpms(d, idxs);
+    Ok(idxs.iter().zip(full.iter().zip(&zero)).filter(|(_, (f, z))| follows_pwm(**f, **z)).map(|(&i, _)| i).collect())
+}
+
 fn run(d: &Daemon, idxs: &[usize]) {
     let mut results: Vec<Measured> = idxs.iter().map(|_| Measured::default()).collect();
-    let outcome = measure(d, idxs, &mut results);
+    let outcome = measure(d, idxs, &mut results).map(|()| idxs.iter().copied().zip(results).collect());
+    finish(d, idxs, outcome, "Calibration", |_| "Calibration complete.".into());
+}
+
+fn run_retest(d: &Daemon, idxs: &[usize]) {
+    let outcome = probe(d, idxs).and_then(|live| {
+        let mut results: Vec<Measured> = live.iter().map(|_| Measured::default()).collect();
+        if !live.is_empty() {
+            measure(d, &live, &mut results)?;
+        }
+        Ok(live.into_iter().zip(results).collect::<Vec<_>>())
+    });
+    finish(d, idxs, outcome, "Re-test", |names| match names.len() {
+        0 => String::new(),
+        1 => format!("{} follows PWM now: calibrated and on its curve.", names[0]),
+        _ => format!("{} follow PWM now: calibrated and on their curves.", names.join(", ")),
+    });
+}
+
+/// Store measurements, report, and hand the fans back to the control loop
+/// (or the BIOS, for fans we cannot steer).
+fn finish(
+    d: &Daemon,
+    idxs: &[usize],
+    outcome: Result<Vec<(usize, Measured)>, String>,
+    what: &str,
+    done: impl FnOnce(&[String]) -> String,
+) {
     let mut core = d.lock();
-    match &outcome {
-        Ok(()) => {
-            for (&i, r) in idxs.iter().zip(&results) {
-                core.fans[i].cfg.calibration = Some(summarise(r.table.clone(), r.stop_pwm, r.start_pwm));
+    match outcome {
+        Ok(measured) => {
+            let names: Vec<String> = measured.iter().map(|(i, _)| core.fans[*i].cfg.label.clone()).collect();
+            for (i, r) in measured {
+                core.fans[i].cfg.calibration = Some(summarise(r.table, r.stop_pwm, r.start_pwm));
             }
-            core.message = crate::daemon::unresponsive_message(&core.fans)
-                .map_or("Calibration complete".into(), |m| format!("Calibration complete. {m}"));
+            let msgs: Vec<String> = [done(&names)].into_iter().chain(crate::daemon::unresponsive_message(&core.fans)).filter(|m| !m.is_empty()).collect();
+            core.message = msgs.join(" ");
         }
         Err(e) => {
-            eprintln!("warning: calibration aborted: {e}");
-            core.message = format!("Calibration failed: {e}");
+            eprintln!("warning: {} aborted: {e}", what.to_lowercase());
+            core.message = format!("{what} failed: {e}");
         }
     }
     let curve_mode = core.state.mode == "curve";
@@ -308,6 +375,15 @@ mod tests {
         let cal = summarise(t.into(), Some(0), Some(40));
         assert_eq!(cal.stop_pwm, Some(0));
         assert_eq!(cal.floor_pwm, Some(35));
+    }
+
+    #[test]
+    fn retest_probe_threshold() {
+        // System fan 1 on the B650M D3HP (3-pin, header in PWM mode).
+        assert!(!follows_pwm(1159, 1123));
+        assert!(follows_pwm(1300, 0), "voltage-mode fan stops at duty 0");
+        assert!(follows_pwm(1300, 600), "voltage-mode fan with a minimum voltage");
+        assert!(!follows_pwm(0, 0), "empty header");
     }
 
     #[test]

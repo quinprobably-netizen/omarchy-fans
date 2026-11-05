@@ -24,6 +24,7 @@ fn main() {
         run_dir: env_or("OMARCHY_FANS_RUN", "/run/omarchy-fans"),
         state_dir: env_or("OMARCHY_FANS_STATE", "/var/lib/omarchy-fans"),
         group: "wheel".into(),
+        pci_xe: env_or("OMARCHY_FANS_XE", "/sys/bus/pci/drivers/xe"),
     };
     let mut command = "run".to_string();
     let mut interval = 1.0;

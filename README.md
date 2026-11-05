@@ -1,10 +1,12 @@
 # omarchy-fans
 
-Fan curves for motherboard PWM fans, with an Omarchy bar widget.
+Fan curves for motherboard PWM fans and Intel Arc A-series GPU fans, with an [Omarchy](https://omarchy.org) bar widget.
 
-- **`omarchy-fand`**: Rust daemon (root, systemd). Reads hwmon temperatures and drives the PWM fan headers.
+- **`omarchy-fand`**: Rust daemon (root, systemd). Reads hwmon temperatures and drives the PWM fan headers, plus an Arc A-series card's fans through its PCODE fan table.
 - **`omarchy-fans`**: CLI. The shell plugin uses it too.
 - **`qqq.fans`**: Omarchy shell plugin. Bar widget with live RPM and temps, profile buttons, and a curve editor you drag.
+
+Only want the GPU part? [arc-fan](https://github.com/quinprobably-netizen/arc-fan) is the Arc fan controller as a standalone tool.
 
 Built for a Gigabyte B650M D3HP (ITE IT8689E, in-kernel `it87` driver) with a Ryzen 8000G and an Arc A580. It works with any board whose fan chip exposes `pwmN`/`pwmN_enable` in hwmon.
 
@@ -45,7 +47,22 @@ With frankcrawford/it87, the CPU fan (438–1650 RPM) and System fan 2 (0–1580
 
 ### 3-pin fans
 
-A 3-pin fan has no PWM wire, so on a header in PWM mode it runs at full voltage whatever the duty (System fan 1 here: flat ~1120–1160 RPM even with the DKMS driver). `it87` has no sysfs switch for the header's DC mode. Set the header to **Voltage** mode in the BIOS (Smart Fan 6, per header "Fan Control Mode"), boot, then `omarchy-fans calibrate`. The duty register then sets the output voltage instead.
+A 3-pin fan has no PWM wire, so on a header in PWM mode it runs at full voltage whatever the duty (System fan 1 here: flat ~1120–1160 RPM even with the DKMS driver). `it87` has no sysfs switch for the header's DC mode, so only the BIOS can change it: set the header to **Voltage** mode (Smart Fan 6, per-header "Fan Control Mode") and reboot. The duty register then sets the output voltage.
+
+You don't need to recalibrate by hand. Every time the daemon starts it **re-tests** each fan that ignored PWM: about 15 s at full duty, then at zero. A fan that now follows PWM gets a full calibration and goes onto its curve. A fan that still ignores PWM stays with the BIOS. The panel marks these fans **ignores PWM · BIOS**, says how to fix them, and has a **Re-test** button per fan (`omarchy-fans retest`).
+
+### Intel Arc A-series GPU fans
+
+Mainline `xe` only reports an Arc card's fan RPM. On DG2 (Alchemist: A380, A580, A750, A770) the daemon drives the fans itself through the GPU's PCODE mailbox (BAR0 MMIO, command `0x7D`). It uses the user fan table that DG2 firmware accepts:
+
+- subcommand 1 sets the number of points (0 means the firmware's stock curve)
+- subcommand 2 writes the points two at a time, packed as `temp | speed% << 8`
+
+The protocol was reverse-engineered by [AIVirtuoso/intel-arc-a770-fan-control](https://github.com/AIVirtuoso/intel-arc-a770-fan-control) and verified here on an ASRock A580: 50 % ≈ 1900 rpm, 80 % ≈ 2500, 100 % ≈ 3280. (The Battlemage subcommands from Intel's pending `xe` fan patches do nothing on DG2.)
+
+The card shows up as **GPU fan** (`xe/gpu`, role `gpu`) with its own curves on the GPU and VRAM sensors in every profile. By default it may stop when the card is cool, as the stock firmware does (`omarchy-fans fan gpu --no-stop` keeps it spinning). Each duty is sent as a flat table that still ramps to 100 % between 85 and 95 °C. So if the daemon hangs, the card cools itself. The table is re-sent every 30 s because suspend-to-RAM clears it. Hand to BIOS, daemon exit and `omarchy-fand restore` put the stock curve back. Calibration skips the GPU fan (it slews ~50 rpm/s); its 0 % is 40 % duty, the lowest the fans hold without hunting.
+
+The daemon sends mailbox commands without the `xe` driver's PCODE lock, so it checks the mailbox's READY bit first and retries if it is busy. `arc-pcode` (`target/release/arc-pcode`, root) is a diagnostics tool: `check`, `dg2-set PCT`, `dg2-auto`, `dg2-test`, and read-only register watching.
 
 ## How the curves are optimised
 
@@ -71,7 +88,7 @@ Profiles: **Silent**, **Balanced** (default), **Performance**, **Full**, and **C
 - If a sensor stops reading, every fan that depends on it goes to 100 %.
 - A fan commanded to spin that reads 0 RPM is flagged STALLED, and the bar widget turns red.
 - On exit, crash, or `systemctl stop`, every channel goes back to the BIOS's automatic mode (`ExecStopPost=omarchy-fand restore`).
-- Calibration aborts and restores the curves if the CPU gets warm (80 °C).
+- Calibration aborts and restores the curves if the CPU gets warm (80 °C). Fans that are not being calibrated stay on their curves meanwhile.
 - **Hand to BIOS** (or `omarchy-fans auto`) gives control back to the motherboard at any time.
 - The control socket is limited to the `wheel` group. The status file is world-readable.
 
@@ -87,7 +104,8 @@ omarchy-fans curve case gpu 60:10,80:40,92:100
 omarchy-fans tuning --ramp-down 2 --hysteresis 4
 omarchy-fans fan pwm2 --label "Front intake" --role case
 omarchy-fans fan pwm3 --allow-stop   # let a case fan stop when the curve is at 0 %
-omarchy-fans calibrate
+omarchy-fans calibrate [fan-id ...] # all fans, or just the ones named
+omarchy-fans retest [fan-id ...]    # re-check fans that ignored PWM
 omarchy-fans auto | resume
 ```
 
@@ -111,3 +129,7 @@ node --test plugin/tests/      # panel model tests
 ```
 
 `tests/sim.rs` runs the real daemon against a fake `/sys/class/hwmon` with simulated fans. The fans have stop/start hysteresis, nonlinear RPM, and empty headers.
+
+## License
+
+MIT

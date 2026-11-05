@@ -37,6 +37,9 @@ struct FakeHw {
     xe: PathBuf,
     it: PathBuf,
     spinning: Arc<Mutex<[bool; 3]>>,
+    /// Header 4 ignores PWM (3-pin fan, header in PWM mode). Clearing it is
+    /// the BIOS switch to Voltage mode: duty then sets the fan's voltage.
+    deaf4: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     sim: Option<thread::JoinHandle<()>>,
 }
@@ -95,8 +98,9 @@ impl FakeHw {
 
         let spinning = Arc::new(Mutex::new([true; 3]));
         let stop = Arc::new(AtomicBool::new(false));
+        let deaf4 = Arc::new(AtomicBool::new(true));
         let sim = {
-            let (it, spinning, stop) = (it.clone(), spinning.clone(), stop.clone());
+            let (it, spinning, stop, deaf4) = (it.clone(), spinning.clone(), stop.clone(), deaf4.clone());
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     for i in 0..3 {
@@ -112,12 +116,21 @@ impl FakeHw {
                     // Header 4: a fan the driver cannot steer (as on Gigabyte
                     // boards under mainline it87). RPM wanders, ignores PWM.
                     let wobble = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() / 700 % 7) as i64;
-                    w(&it.join("fan4_input"), 1140 + wobble * 15);
+                    let manual = fs::read_to_string(it.join("pwm4_enable")).ok().is_some_and(|e| e.trim() == "1");
+                    let duty = fs::read_to_string(it.join("pwm4")).ok().and_then(|p| p.trim().parse::<i64>().ok());
+                    let rpm4 = match duty {
+                        // Voltage mode: below ~5 V the motor stalls.
+                        Some(d) if manual && !deaf4.load(Ordering::Relaxed) => {
+                            if d < 100 { 0 } else { (1300.0 * (d as f64 / 255.0).powf(0.8)) as i64 }
+                        }
+                        _ => 1140 + wobble * 15,
+                    };
+                    w(&it.join("fan4_input"), rpm4);
                     thread::sleep(Duration::from_millis(2));
                 }
             })
         };
-        FakeHw { root, k10, xe, it, spinning, stop, sim: Some(sim) }
+        FakeHw { root, k10, xe, it, spinning, deaf4, stop, sim: Some(sim) }
     }
 
     fn cpu(&self, c: f64) {
@@ -153,21 +166,109 @@ struct Rig {
     hw: FakeHw,
     d: Daemon,
     paths: Paths,
+    pcode: Option<FakePcode>,
+}
+
+/// A DG2 card's BAR0 as a file, with a thread playing PCODE: it logs each
+/// FAN_SPEED_CONTROL request as (subcommand, data0) and completes it.
+struct FakePcode {
+    log: Arc<Mutex<Vec<(u8, u32)>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+const MAILBOX: usize = 0x138124;
+
+impl FakePcode {
+    fn new(dev: &Path) -> Self {
+        fs::create_dir_all(dev.join("power")).unwrap();
+        fs::write(dev.join("device"), "0x56a2\n").unwrap();
+        fs::write(dev.join("power/runtime_status"), "active\n").unwrap();
+        let bar = fs::File::create(dev.join("resource0")).unwrap();
+        bar.set_len(16 << 20).unwrap();
+        drop(bar);
+        let file = fs::OpenOptions::new().read(true).write(true).open(dev.join("resource0")).unwrap();
+        use std::os::fd::AsRawFd;
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), 16 << 20, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0)
+        } as usize;
+        assert_ne!(ptr, libc::MAP_FAILED as usize);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (log, stop) = (log.clone(), stop.clone());
+            thread::spawn(move || {
+                let reg = |off: usize| (ptr + off) as *mut u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let mb = unsafe { std::ptr::read_volatile(reg(MAILBOX)) };
+                    if mb & (1 << 31) != 0 {
+                        let data0 = unsafe { std::ptr::read_volatile(reg(MAILBOX + 4)) };
+                        if mb & 0xff == 0x7d {
+                            log.lock().unwrap().push((((mb >> 8) & 0xff) as u8, data0));
+                        }
+                        unsafe { std::ptr::write_volatile(reg(MAILBOX + 4), 0) };
+                        // Done, status 0 in the low byte (as the A580 does).
+                        unsafe { std::ptr::write_volatile(reg(MAILBOX), 0) };
+                    }
+                    thread::sleep(Duration::from_micros(20));
+                }
+                unsafe { libc::munmap(ptr as *mut libc::c_void, 16 << 20) };
+            })
+        };
+        FakePcode { log, stop, thread: Some(thread) }
+    }
+
+    fn log(&self) -> Vec<(u8, u32)> {
+        self.log.lock().unwrap().clone()
+    }
+
+    /// Flat duty (percent) of the last complete table, or None for stock.
+    fn last_table(&self) -> Option<Option<u8>> {
+        let log = self.log();
+        let start = log.iter().rposition(|(sub, _)| *sub == 1)?;
+        let (_, count) = log[start];
+        if count == 0 {
+            return Some(None);
+        }
+        let first_pair = log.get(start + 1)?;
+        assert_eq!(first_pair.0, 2, "points follow the count");
+        Some(Some(((first_pair.1 >> 8) & 0xff) as u8))
+    }
+}
+
+impl Drop for FakePcode {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Rig {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// With a simulated Arc A580 on the xe PCI driver.
+    fn with_gpu() -> Self {
+        Self::build(true)
+    }
+
+    fn build(gpu: bool) -> Self {
         let hw = FakeHw::new();
         let paths = Paths {
             sysfs: hw.root.clone(),
             run_dir: hw.root.join("run"),
             state_dir: hw.root.join("state"),
             group: "nonexistent-group".into(),
+            pci_xe: hw.root.join("pci-xe"),
         };
         fs::create_dir_all(&paths.run_dir).unwrap();
+        let pcode = gpu.then(|| FakePcode::new(&paths.pci_xe.join("0000:03:00.0")));
         let d = Daemon::new(paths.clone(), 1.0);
         d.lock().time_scale = 0.02;
-        Rig { hw, d, paths }
+        Rig { hw, d, paths, pcode }
     }
 
     /// `n` ticks of 1 s starting at `start`; returns the next start time.
@@ -187,6 +288,15 @@ impl Rig {
     }
 
     fn calibrate(&self) {
+        self.run_cal(json!({"cmd": "calibrate"}));
+    }
+
+    fn retest(&self) {
+        self.run_cal(json!({"cmd": "retest"}));
+    }
+
+    /// Run a calibration-style command to completion with the loop ticking.
+    fn run_cal(&self, req: Value) {
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = {
             let (d, stop) = (self.d.clone(), stop.clone());
@@ -198,7 +308,7 @@ impl Rig {
                 }
             })
         };
-        self.cmd(json!({"cmd": "calibrate"})).unwrap();
+        self.cmd(req).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.d.lock().calibration.is_some() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
@@ -481,3 +591,169 @@ fn empty_headers_never_flag_stall() {
     assert!(rig.fan(0, |f| f.seen_spinning));
     assert!(!rig.fan(4, |f| f.seen_spinning || f.stalled), "empty header pwm5 must not report a stall");
 }
+
+// ---- fans that ignore PWM -------------------------------------------------
+
+#[test]
+fn retest_takes_control_after_switch_to_voltage_mode() {
+    let rig = Rig::new();
+    rig.calibrate();
+    assert!(!rig.fan(3, |f| f.responsive()));
+    rig.hw.deaf4.store(false, Ordering::Relaxed); // BIOS: header 4 -> Voltage
+    rig.retest();
+    assert!(rig.fan(3, |f| f.controllable() && f.calibrated()), "{}", rig.d.lock().message);
+    assert!(rig.d.lock().message.contains("System fan 3 follows PWM now"), "{}", rig.d.lock().message);
+    // Voltage-mode fan stalls below duty 100: floor must sit above that.
+    assert!(rig.fan(3, |f| f.floor_pwm()) > 100);
+    rig.ticks(3, 70_000.0);
+    assert_eq!(rig.hw.enable(4), 1, "now driven by the curve");
+    assert!(rig.hw.pwm(4) >= rig.fan(3, |f| f.floor_pwm()));
+    let saved: Value = serde_json::from_slice(&fs::read(rig.paths.state_file()).unwrap()).unwrap();
+    assert_eq!(saved["fans"]["it8689/pwm4"]["calibration"]["responsive"], true);
+}
+
+#[test]
+fn retest_leaves_still_deaf_fan_with_bios() {
+    let rig = Rig::new();
+    rig.calibrate();
+    rig.retest();
+    assert!(!rig.fan(3, |f| f.responsive()));
+    assert!(rig.d.lock().message.contains("System fan 3 ignores PWM"), "{}", rig.d.lock().message);
+    rig.ticks(3, 70_000.0);
+    assert_eq!(rig.hw.enable(4), 2, "handed back to the BIOS");
+}
+
+#[test]
+fn retest_needs_a_deaf_fan() {
+    let rig = Rig::new();
+    let err = rig.cmd(json!({"cmd": "retest"})).unwrap_err();
+    assert!(err.contains("no fans that ignore PWM"), "{err}");
+    assert!(rig.d.lock().calibration.is_none());
+}
+
+#[test]
+fn daemon_start_retests_deaf_fans() {
+    let rig = Rig::new();
+    rig.calibrate();
+    rig.hw.deaf4.store(false, Ordering::Relaxed);
+    // Reboot: a fresh daemon with the saved calibration.
+    rig.d.request_stop();
+    let d2 = Daemon::new(rig.paths.clone(), 0.05);
+    d2.lock().time_scale = 0.02;
+    let runner = {
+        let d2 = d2.clone();
+        thread::spawn(move || d2.run())
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !d2.lock().fans[3].controllable() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    while d2.lock().calibration.is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(d2.lock().fans[3].controllable() && d2.lock().fans[3].calibrated());
+    d2.request_stop();
+    runner.join().unwrap();
+}
+
+#[test]
+fn other_fans_stay_on_curve_while_one_calibrates() {
+    let rig = Rig::new();
+    rig.hw.cpu(75.0);
+    rig.cmd(json!({"cmd": "calibrate", "fans": ["pwm3"]})).unwrap();
+    rig.ticks(40, 1000.0);
+    // balanced cpu curve at 75 °C -> 65 %
+    assert!(rig.fan(0, |f| f.percent.is_some_and(|p| p > 60.0)), "CPU fan must keep following its curve");
+    assert!(rig.fan(2, |f| f.percent.is_none()), "fan under calibration is left alone");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rig.d.lock().calibration.is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(rig.fan(2, |f| f.calibrated()));
+    assert!(!rig.fan(0, |f| f.calibrated()), "only the selected fan is calibrated");
+}
+
+// ---- Arc A580 GPU fan -------------------------------------------------------
+
+#[test]
+fn gpu_fan_is_discovered() {
+    let rig = Rig::with_gpu();
+    let core = rig.d.lock();
+    let f = core.fans.last().unwrap();
+    assert_eq!(f.id, "xe/gpu", "uses the xe hwmon chip for RPM");
+    assert_eq!((f.cfg.label.as_str(), f.cfg.role.as_str()), ("GPU fan", "gpu"));
+    assert!(f.is_gpu() && f.cfg.allow_stop);
+    assert_eq!(core.status()["fans"].as_array().unwrap().last().unwrap()["kind"], "gpu");
+}
+
+#[test]
+fn gpu_fan_follows_gpu_curve() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(85.0);
+    rig.ticks(40, 1000.0);
+    // balanced gpu curve at 85 °C -> 75 %, mapped above the 40 % floor
+    let pct = rig.pcode.as_ref().unwrap().last_table().unwrap().unwrap();
+    assert!((80..=88).contains(&pct), "{pct}");
+    let log = rig.pcode.as_ref().unwrap().log();
+    let start = log.iter().rposition(|(s, _)| *s == 1).unwrap();
+    assert_eq!(log[start], (1, 4), "flat table with a hot ramp: 4 points");
+    assert_eq!(log[start + 2].1 & 0xffff, 95 | (100 << 8), "firmware ramps to 100% at 95 °C");
+}
+
+#[test]
+fn cool_gpu_lets_fan_stop() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(40.0);
+    rig.ticks(5, 1000.0);
+    assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(Some(0)));
+}
+
+#[test]
+fn gpu_critical_forces_full_speed() {
+    let rig = Rig::with_gpu();
+    let t = rig.ticks(5, 1000.0);
+    rig.hw.gpu(99.0);
+    rig.ticks(1, t);
+    assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(Some(100)));
+}
+
+#[test]
+fn gpu_fan_handed_back_to_stock_curve() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(80.0);
+    let t = rig.ticks(3, 1000.0);
+    assert!(matches!(rig.pcode.as_ref().unwrap().last_table(), Some(Some(_))));
+    rig.cmd(json!({"cmd": "mode", "mode": "auto"})).unwrap();
+    assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(None), "count 0 = stock curve");
+    rig.ticks(3, t);
+    assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(None), "auto mode leaves it alone");
+}
+
+#[test]
+fn restore_resets_gpu_to_stock() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(80.0);
+    rig.ticks(3, 1000.0);
+    restore(&rig.paths);
+    assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(None));
+}
+
+#[test]
+fn calibration_skips_gpu_fan() {
+    let rig = Rig::with_gpu();
+    rig.cmd(json!({"cmd": "calibrate"})).unwrap();
+    let fans = rig.d.lock().calibration.as_ref().unwrap().fans.clone();
+    assert!(!fans.iter().any(|f| f == "xe/gpu"), "{fans:?}");
+    rig.d.lock().calibration = None;
+}
+
+#[test]
+fn gpu_curve_is_editable() {
+    let rig = Rig::with_gpu();
+    rig.cmd(json!({"cmd": "curve", "role": "gpu", "sensor": "gpu", "points": [[40, 50], [90, 100]]})).unwrap();
+    rig.hw.gpu(40.0);
+    rig.ticks(3, 1000.0);
+    let pct = rig.pcode.as_ref().unwrap().last_table().unwrap().unwrap();
+    assert!((68..=72).contains(&pct), "50% of the 40..100% range is 70%, got {pct}");
+}
+

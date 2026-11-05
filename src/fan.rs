@@ -1,6 +1,7 @@
 //! PWM fan channels: persistent config, calibration data, runtime state.
 
 use crate::curve::{interp, Point};
+use crate::gpufan::{GpuFan, GPU_FLOOR_PWM};
 use crate::util::clamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -87,6 +88,8 @@ pub struct Fan {
     /// Tach has reported RPM > 0 since startup (tells empty headers apart).
     pub seen_spinning: bool,
     pub reason: String,
+    /// Set for a GPU fan driven through PCODE instead of hwmon PWM.
+    pub gpu: Option<GpuFan>,
 }
 
 impl Fan {
@@ -107,7 +110,21 @@ impl Fan {
             stalled: false,
             seen_spinning: false,
             reason: String::new(),
+            gpu: None,
         }
+    }
+
+    /// The fan(s) of an Arc A-series card. `chip` is its hwmon chip (for
+    /// RPM), if found.
+    pub fn new_gpu(gpu: GpuFan, chip: Option<String>, cfg: FanConfig) -> Self {
+        let has_tach = chip.is_some();
+        let mut f = Fan::new(chip.unwrap_or_else(|| format!("xe-{}", gpu.address())), "gpu".into(), has_tach.then(|| "fan1".into()), cfg);
+        f.gpu = Some(gpu);
+        f
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        self.gpu.is_some()
     }
 
     pub fn connected(&self) -> bool {
@@ -129,7 +146,8 @@ impl Fan {
     }
 
     pub fn floor_pwm(&self) -> i64 {
-        self.cfg.calibration.as_ref().and_then(|c| c.floor_pwm).unwrap_or(DEFAULT_FLOOR_PWM)
+        let default = if self.is_gpu() { GPU_FLOOR_PWM } else { DEFAULT_FLOOR_PWM };
+        self.cfg.calibration.as_ref().and_then(|c| c.floor_pwm).unwrap_or(default)
     }
 
     pub fn start_pwm(&self) -> i64 {
@@ -137,7 +155,7 @@ impl Fan {
             .calibration
             .as_ref()
             .and_then(|c| c.start_pwm)
-            .unwrap_or_else(|| self.floor_pwm().max(100))
+            .unwrap_or_else(|| if self.is_gpu() { self.floor_pwm() } else { self.floor_pwm().max(100) })
     }
 
     /// Map 0-100% onto PWM. Calibrated fans are linear in RPM between their
@@ -169,6 +187,7 @@ impl Fan {
     pub fn to_json(&self) -> Value {
         json!({
             "id": self.id,
+            "kind": if self.is_gpu() { "gpu" } else { "hwmon" },
             "label": self.cfg.label,
             "role": self.cfg.role,
             "enabled": self.cfg.enabled,

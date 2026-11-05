@@ -16,6 +16,7 @@ const EXCLUDED_PWM_CHIPS: [&str; 6] = ["amdgpu", "nouveau", "nvidia", "radeon", 
 pub struct Hwmon {
     root: PathBuf,
     chips: BTreeMap<String, PathBuf>,
+    devices: BTreeMap<String, PathBuf>,
 }
 
 /// A controllable PWM output: chip key, `pwmN`, and matching `fanN` tach if any.
@@ -49,7 +50,7 @@ fn list(path: &Path) -> Vec<String> {
 
 impl Hwmon {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        let mut hw = Hwmon { root: root.into(), chips: BTreeMap::new() };
+        let mut hw = Hwmon { root: root.into(), chips: BTreeMap::new(), devices: BTreeMap::new() };
         hw.rescan();
         hw
     }
@@ -70,15 +71,31 @@ impl Hwmon {
             .collect();
         found.sort();
         self.chips.clear();
-        for (name, _, path) in found {
+        self.devices.clear();
+        for (name, dev, path) in found {
             let mut key = name.clone();
             let mut n = 2;
             while self.chips.contains_key(&key) {
                 key = format!("{name}#{n}");
                 n += 1;
             }
+            self.devices.insert(key.clone(), dev);
             self.chips.insert(key, path);
         }
+    }
+
+    /// Chip key for the hwmon belonging to a device (e.g. a GPU's PCI dir);
+    /// falls back to the only chip with that name.
+    pub fn chip_for_device(&self, dev: &Path, name: &str) -> Option<String> {
+        let dev = fs::canonicalize(dev).unwrap_or_else(|_| dev.to_path_buf());
+        self.devices
+            .iter()
+            .find(|(_, d)| **d == dev)
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                let same: Vec<&String> = self.chips.keys().filter(|k| base_name(k) == name).collect();
+                (same.len() == 1).then(|| same[0].clone())
+            })
     }
 
     pub fn attr(&self, chip: &str, attr: &str) -> Option<PathBuf> {

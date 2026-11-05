@@ -7,9 +7,11 @@ pub mod calibrate;
 pub mod curve;
 pub mod daemon;
 pub mod fan;
+pub mod gpufan;
 pub mod hwmon;
 pub mod profiles;
 pub mod sensor;
 pub mod util;
+pub mod xe_pcode;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

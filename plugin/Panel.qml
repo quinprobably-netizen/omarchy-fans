@@ -337,28 +337,74 @@ Panel {
           Repeater {
             model: root.fans
             Item {
+              id: fanRow
               required property var modelData
+              readonly property bool deaf: Model.ignoresPwm(modelData)
+              readonly property bool retesting: Model.retestRunning(root.status, modelData.id)
               width: parent.width
-              implicitHeight: fanName.implicitHeight + Style.space(4) + Style.space(6)
+              implicitHeight: Math.max(fanName.implicitHeight, retestButton.visible ? retestButton.implicitHeight : 0)
+                + (fanHint.visible ? Style.space(2) + fanHint.implicitHeight : 0)
+                + Style.space(4) + Style.space(6)
 
               Text {
                 id: fanName
                 textFormat: Text.PlainText
-                text: modelData.label + (modelData.responsive === false ? "  ·  BIOS (ignores PWM)"
-                  : (modelData.calibrated ? "" : "  ·  uncalibrated"))
+                text: modelData.label + (Model.fanTag(modelData) !== "" ? "  ·  " + Model.fanTag(modelData) : "")
                 color: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 anchors.left: parent.left
+                anchors.right: fanRpm.left
+                anchors.rightMargin: Style.space(8)
+                elide: Text.ElideRight
+                anchors.verticalCenter: retestButton.visible ? retestButton.verticalCenter : undefined
               }
               Text {
+                id: fanRpm
                 textFormat: Text.PlainText
                 text: modelData.stalled ? "STALLED" : (modelData.rpm === null ? "—" : modelData.rpm + " rpm")
                 color: modelData.stalled ? root.urgent : root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
+                anchors.right: retestButton.visible ? retestButton.left : parent.right
+                anchors.rightMargin: retestButton.visible ? Style.space(8) : 0
+                anchors.verticalCenter: fanName.verticalCenter
+              }
+              // Fans that ignored PWM: check again on demand (the daemon also
+              // does this at every start, e.g. after a BIOS change).
+              Button {
+                id: retestButton
+                visible: fanRow.deaf
                 anchors.right: parent.right
+                anchors.top: parent.top
+                iconText: "󰑓"
+                iconSpinning: fanRow.retesting
+                text: fanRow.retesting ? (root.status.calibration.step || "Re-testing") : "Re-test"
+                tooltipText: "Check whether this fan follows PWM now (~15 s; the fan briefly stops if it does). " +
+                  "If it responds it is calibrated (~2 min) and put on its curve."
+                fontSize: Style.font.caption
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(2)
+                bordered: true
+                enabled: !root.calibrating
+                onClicked: root.run(["retest", modelData.id])
+              }
+              Text {
+                id: fanHint
+                visible: fanRow.deaf
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: retestButton.bottom
+                anchors.topMargin: Style.space(2)
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                text: Model.fanHint(modelData)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
               Rectangle {
                 id: track

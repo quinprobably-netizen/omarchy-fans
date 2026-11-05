@@ -1,7 +1,8 @@
 // Pure helpers for the fans panel. No QML types here so tests/model.test.js
 // can load this file under node.
 
-var ROLE_LABELS = { cpu: "CPU fan", case: "Case fans" }
+var ROLE_LABELS = { cpu: "CPU fan", case: "Case", gpu: "GPU fan" }
+var ROLE_SHORT = { cpu: "CPU", case: "Case", gpu: "GPU" }
 var PROFILE_ICONS = { silent: "󰤄", balanced: "󰾅", performance: "󰓅", full: "󰈐", custom: "󰒓" }
 
 // Chart range. Below 20°C nothing on a desktop is interesting; above 100°C
@@ -44,7 +45,10 @@ function formatTemp(value) {
 function connectedFans(st) {
   if (!st || !st.fans) return []
   // Uncalibrated headers that have never spun are almost always empty.
-  return st.fans.filter(function(f) { return f.connected && (f.calibrated || f.seen_spinning || f.rpm > 0) })
+  // The GPU fan is always present; it rests at 0 rpm when the card is cool.
+  return st.fans.filter(function(f) {
+    return f.connected && (f.kind === "gpu" || f.calibrated || f.seen_spinning || f.rpm > 0)
+  })
 }
 
 // One editor tab per (role, sensor) curve in the active profile, limited to
@@ -53,7 +57,7 @@ function curveTabs(st) {
   var tabs = []
   if (!st || !st.curves) return tabs
   var fans = connectedFans(st)
-  var roles = ["cpu", "case"]
+  var roles = ["cpu", "case", "gpu"]
   for (var r = 0; r < roles.length; r++) {
     var role = roles[r]
     if (!fans.some(function(f) { return f.role === role })) continue
@@ -67,7 +71,8 @@ function curveTabs(st) {
         key: role + ":" + sid,
         role: role,
         sensor: sid,
-        label: (role === "cpu" ? "CPU fan" : "Case") + " ← " + sen.label,
+        // Compact so five tabs fit: "CPU fan", "Case ← GPU", "GPU ← VRAM".
+        label: sid === role ? ROLE_LABELS[role] : ROLE_SHORT[role] + " ← " + sen.label,
         points: curves[sid]
       })
     }
@@ -149,9 +154,33 @@ function nearestPoint(points, t, p, maxT, maxP) {
   return best
 }
 
+// A connected fan whose speed ignored PWM at calibration: the BIOS drives it.
+function ignoresPwm(f) {
+  return !!f && f.connected === true && f.responsive === false
+}
+
+function fanTag(f) {
+  if (ignoresPwm(f)) return "ignores PWM · BIOS"
+  if (f && f.kind === "gpu") return "card"
+  return f && f.connected && !f.calibrated ? "uncalibrated" : ""
+}
+
+// How to make a PWM-deaf fan controllable. A 3-pin fan has no PWM wire, so
+// only the header's Voltage (DC) mode, a BIOS setting, can slow it down.
+function fanHint(f) {
+  if (!ignoresPwm(f)) return ""
+  return "3-pin fan: set this header to Voltage mode in the BIOS (Smart Fan → Fan Control Mode), then reboot. " +
+    "It is re-tested at every start and goes onto its curve once it responds."
+}
+
+function retestRunning(st, fanId) {
+  var c = st && st.calibration
+  return !!c && c.kind === "retest" && (!fanId || (c.fans || []).indexOf(fanId) >= 0)
+}
+
 function modeLabel(st, alive) {
   if (!st || !alive) return "Offline"
-  if (st.calibration) return "Calibrating " + Math.round(Number(st.calibration.progress || 0) * 100) + "%"
+  if (st.calibration) return (st.calibration.kind === "retest" ? "Re-testing " : "Calibrating ") + Math.round(Number(st.calibration.progress || 0) * 100) + "%"
   if (st.mode === "auto") return "BIOS"
   return "Curve"
 }
@@ -202,7 +231,8 @@ if (typeof module !== "undefined") {
     connectedFans: connectedFans, curveTabs: curveTabs, findTab: findTab, interp: interp,
     clonePoints: clonePoints, cpuFanRpm: cpuFanRpm, PROFILE_ICONS: PROFILE_ICONS,
     movePoint: movePoint, addPoint: addPoint, removePoint: removePoint, pointsArg: pointsArg,
-    nearestPoint: nearestPoint, modeLabel: modeLabel, profileLabel: profileLabel, hasStall: hasStall,
+    nearestPoint: nearestPoint, modeLabel: modeLabel, ignoresPwm: ignoresPwm, fanTag: fanTag,
+    fanHint: fanHint, retestRunning: retestRunning, profileLabel: profileLabel, hasStall: hasStall,
     hasCritical: hasCritical, barLabel: barLabel, tooltip: tooltip, formatTemp: formatTemp,
     T_MIN: T_MIN, T_MAX: T_MAX
   }
