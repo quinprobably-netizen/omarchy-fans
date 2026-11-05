@@ -13,4 +13,4 @@ jobs:
           node-version: 22
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
-      - run: node --test plugin/tests/
+      - run: node --test plugin/tests/*.test.js

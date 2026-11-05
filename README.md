@@ -125,7 +125,7 @@ Widget settings (`~/.config/omarchy/shell.json`, `qqq.fans` entry): `barMode` is
 
 ```sh
 cargo test                     # unit + simulated-hwmon integration tests
-node --test plugin/tests/      # panel model tests
+node --test plugin/tests/*.test.js  # panel model tests
 ```
 
 `tests/sim.rs` runs the real daemon against a fake `/sys/class/hwmon` with simulated fans. The fans have stop/start hysteresis, nonlinear RPM, and empty headers.
