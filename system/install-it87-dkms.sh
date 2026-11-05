@@ -15,6 +15,16 @@ trap 'rm -rf "$work"' EXIT
 git clone --depth 1 https://github.com/frankcrawford/it87 "$work/it87"
 (cd "$work/it87" && ./dkms-install.sh)
 
+# Upstream's script only builds for the running kernel; the pacman DKMS hook
+# only fires on kernel upgrades. Build for every installed kernel with
+# headers now, or booting another kernel silently falls back to mainline it87.
+ver=$(dkms status it87 | sed -n 's|^it87/\([^,:]*\).*|\1|p' | sort -V | tail -1)
+for kdir in /usr/lib/modules/*/; do
+  k=$(basename "$kdir")
+  [[ -e "$kdir/build" ]] || continue
+  dkms install "it87/$ver" -k "$k" || echo "it87: DKMS build failed for $k" >&2
+done
+
 # Swap the running driver for the DKMS one; the daemon hands fans to the
 # BIOS while it is stopped.
 systemctl stop omarchy-fand.service || true
