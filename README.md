@@ -60,7 +60,11 @@ Mainline `xe` only reports an Arc card's fan RPM. On DG2 (Alchemist: A380, A580,
 
 The protocol was reverse-engineered by [AIVirtuoso/intel-arc-a770-fan-control](https://github.com/AIVirtuoso/intel-arc-a770-fan-control) and verified here on an ASRock A580: 50 % ≈ 1900 rpm, 80 % ≈ 2500, 100 % ≈ 3280. (The Battlemage subcommands from Intel's pending `xe` fan patches do nothing on DG2.)
 
-The card shows up as **GPU fan** (`xe/gpu`, role `gpu`) with its own curves on the GPU and VRAM sensors in every profile. By default it may stop when the card is cool, as the stock firmware does (`omarchy-fans fan gpu --no-stop` keeps it spinning). Each duty is sent as a flat table that still ramps to 100 % between 85 and 95 °C. So if the daemon hangs, the card cools itself. The table is re-sent every 30 s because suspend-to-RAM clears it. Hand to BIOS, daemon exit and `omarchy-fand restore` put the stock curve back. Calibration skips the GPU fan (it slews ~50 rpm/s); its 0 % is 40 % duty, the lowest the fans hold without hunting.
+The mailbox code is the [arc-fan](https://github.com/quinprobably-netizen/arc-fan) crate. Each card gets a worker thread that owns the BAR mapping. The control loop posts the duty it wants and moves on, so a mailbox the driver is holding busy never delays the other fans. The worker always applies the newest duty.
+
+`omarchy-fand.service` conflicts with `arc-fan.service`: starting one stops the other, since both write the same table. The `arc-fan` CLI warns if you use it while the daemon runs.
+
+The card shows up as **GPU fan** (`xe/gpu`, role `gpu`) with its own curves on the GPU and VRAM sensors in every profile. By default it may stop when the card is cool, as the stock firmware does (`omarchy-fans fan gpu --no-stop` keeps it spinning). Each duty is sent as a flat table that still ramps to 100 % between 85 and 95 °C. So if the daemon hangs, the card cools itself. Suspend-to-RAM clears the table, so the daemon re-sends it right after a resume, and every 30 s anyway. Hand to BIOS, daemon exit and `omarchy-fand restore` put the stock curve back. Calibration skips the GPU fan (it slews ~50 rpm/s); its 0 % is 40 % duty, the lowest the fans hold without hunting.
 
 The daemon sends mailbox commands without the `xe` driver's PCODE lock, so it checks the mailbox's READY bit first and retries if it is busy. `arc-pcode` (`target/release/arc-pcode`, root) is a diagnostics tool: `check`, `dg2-set PCT`, `dg2-auto`, `dg2-test`, and read-only register watching.
 
@@ -86,11 +90,13 @@ Profiles: **Silent**, **Balanced** (default), **Performance**, **Full**, and **C
 
 - If any sensor reaches its critical temperature, every fan goes to 100 % at once, with no ramp. Thresholds: CPU 90 °C, GPU 97 °C, VRAM 102 °C, NVMe 75 °C.
 - If a sensor stops reading, every fan that depends on it goes to 100 %.
+- If none of a fan's sensors exist (say `k10temp` hasn't loaded yet), that fan runs at 100 % and the panel says why. The daemon looks for the missing sensor every 10 s. Calibration refuses to start without a CPU sensor, since it couldn't abort on heat.
+- After a resume from suspend, every fan setting is written again. Every tick also checks that each channel is still in manual mode, and takes it back if the firmware reclaimed it.
 - A fan commanded to spin that reads 0 RPM is flagged STALLED, and the bar widget turns red.
 - On exit, crash, or `systemctl stop`, every channel goes back to the BIOS's automatic mode (`ExecStopPost=omarchy-fand restore`).
 - Calibration aborts and restores the curves if the CPU gets warm (80 °C). Fans that are not being calibrated stay on their curves meanwhile.
 - **Hand to BIOS** (or `omarchy-fans auto`) gives control back to the motherboard at any time.
-- The control socket is limited to the `wheel` group. The status file is world-readable.
+- The control socket is limited to the `wheel` group and serves at most 16 clients at once. The status file is world-readable.
 
 ## CLI
 

@@ -9,6 +9,8 @@ description = "Fan-curve daemon, CLI and Omarchy shell plugin for hwmon PWM fans
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+# PCODE mailbox and DG2 fan table, shared with the standalone Arc fan tool.
+arc-fan = { git = "https://github.com/quinprobably-netizen/arc-fan", rev = "d2f66c111629fae47ac3ee604d578de36f92e730" }
 
 [profile.release]
 opt-level = "s"

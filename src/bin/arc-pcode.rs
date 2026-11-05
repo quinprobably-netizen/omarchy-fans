@@ -7,7 +7,8 @@
 //!   dg2-test           stock -> 50% -> 80% -> 40% -> stock, logging RPM
 //!   peek|watch|watchr|scan|corr   read-only register inspection
 
-use omarchy_fans::xe_pcode::*;
+use arc_fan::curve::fixed as dg2_flat_table;
+use arc_fan::pcode::{Error as PcodeError, Mmio, PCODE_DATA0, PCODE_DATA1, PCODE_MAILBOX};
 use std::path::PathBuf;
 
 fn find_gpu() -> Option<PathBuf> {
@@ -43,16 +44,16 @@ fn main() {
             for (name, off) in [("PCU_CR_PACKAGE_TEMPERATURE", 0x145978usize), ("BMG_VRAM_TEMPERATURE", 0x1382c0), ("FAN_1_SPEED (tach)", 0x138140)] {
                 println!("  {name:<28} {off:#08x} = {:#010x}", mmio.read32(off));
             }
-            show("PCODE init status (want 1)", mmio.mailbox_retry(0x7E, 0, 0, 0, 0));
+            show("PCODE init status (want 1)", mmio.request(0x7E, 0, 0, 0));
             println!("  fan {} rpm", hwmon_rpm(&dev).map_or("?".into(), |r| r.to_string()));
         }
-        "dg2-auto" => report(mmio.dg2_commit(&[])),
+        "dg2-auto" => report(mmio.commit(&[])),
         "dg2-set" => {
             let pct: u8 = args.get(1).and_then(|a| a.parse().ok()).filter(|p| *p <= 100).unwrap_or_else(|| {
                 eprintln!("usage: arc-pcode dg2-set PCT (0..100)");
                 std::process::exit(2)
             });
-            report(mmio.dg2_commit(&dg2_flat_table(pct)));
+            report(mmio.commit(&dg2_flat_table(pct)));
         }
         "dg2-test" => dg2_test(&mmio, &dev),
         "peek" => {
@@ -209,7 +210,7 @@ fn dg2_test(m: &Mmio, dev: &std::path::Path) {
     let saved = std::fs::read_to_string(&ctl).unwrap_or_else(|_| "auto".into());
     let _ = std::fs::write(&ctl, "on");
     let phase = |name: &str, table: Vec<(u8, u8)>, secs: u64| {
-        let r = m.dg2_commit(&table);
+        let r = m.commit(&table);
         println!("== {name}: {}", r.as_ref().map_or_else(|e| e.clone(), |_| "ok".into()));
         let _ = hwmon_rpm(dev); // prime the driver's delta
         for t in 0..secs {

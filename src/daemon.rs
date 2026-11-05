@@ -29,7 +29,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,12 @@ pub fn unresponsive_message(fans: &[Fan]) -> Option<String> {
 }
 
 pub const STALL_SECONDS: f64 = 6.0;
+/// While a sensor the active curves use is missing (driver not loaded yet),
+/// look for it this often.
+pub const SENSOR_RESCAN_SECONDS: f64 = 10.0;
+/// Socket clients served at once; more get a "busy" reply. Each one is a
+/// thread that may wait up to 5 s for its request line.
+pub const MAX_CLIENTS: usize = 16;
 
 /// Set from the SIGTERM/SIGINT handler in the daemon binary.
 pub static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
@@ -134,6 +141,21 @@ pub struct Core {
     /// Tests shrink calibration waits with this.
     pub time_scale: f64,
     last_tick: Option<f64>,
+    last_sensor_scan: f64,
+    /// CLOCK_BOOTTIME - CLOCK_MONOTONIC at the last tick; it grows by the
+    /// time spent suspended.
+    sleep_offset: Option<f64>,
+    /// Fans in failsafe for lack of a sensor, for the status message.
+    alert: String,
+}
+
+/// What a fan's curves ask for.
+pub struct Demand {
+    pub percent: f64,
+    /// Sensor that set the percent, or why the fan is in failsafe.
+    pub reason: String,
+    /// Failsafe: go to `percent` at once, no ramp.
+    pub emergency: bool,
 }
 
 type CmdResult = Result<Value, String>;
@@ -152,6 +174,9 @@ impl Core {
             interval,
             time_scale: 1.0,
             last_tick: None,
+            last_sensor_scan: 0.0,
+            sleep_offset: None,
+            alert: String::new(),
         };
         core.setup_hardware();
         core
@@ -200,17 +225,7 @@ impl Core {
     pub fn setup_hardware(&mut self) {
         self.hw.rescan();
         self.sensors.clear();
-        for id in SENSOR_IDS {
-            if let Some(o) = self.state.sensors.get(id)
-                && self.hw.read(&o.chip, &format!("{}_input", o.input)).is_some() {
-                    let label = o.label.clone().unwrap_or_else(|| sensor::label_for(id).into());
-                    self.sensors.push(Sensor::new(id, o.chip.clone(), o.input.clone(), label));
-                    continue;
-                }
-            if let Some((chip, attr)) = sensor::candidates(id).iter().find_map(|(c, l)| self.hw.find_temp(c, *l)) {
-                self.sensors.push(Sensor::new(id, chip, attr, sensor::label_for(id).into()));
-            }
-        }
+        self.add_missing_sensors();
         self.fans = self
             .hw
             .pwm_channels()
@@ -244,6 +259,36 @@ impl Core {
         }
     }
 
+    /// Find sensors not yet known. Existing ones keep their smoothing state.
+    fn add_missing_sensors(&mut self) {
+        for id in SENSOR_IDS {
+            if self.sensor(id).is_some() {
+                continue;
+            }
+            if let Some(o) = self.state.sensors.get(id)
+                && self.hw.read(&o.chip, &format!("{}_input", o.input)).is_some()
+            {
+                let label = o.label.clone().unwrap_or_else(|| sensor::label_for(id).into());
+                self.sensors.push(Sensor::new(id, o.chip.clone(), o.input.clone(), label));
+                continue;
+            }
+            if let Some((chip, attr)) = sensor::candidates(id).iter().find_map(|(c, l)| self.hw.find_temp(c, *l)) {
+                self.sensors.push(Sensor::new(id, chip, attr, sensor::label_for(id).into()));
+            }
+        }
+        self.sensors.sort_by_key(|s| SENSOR_IDS.iter().position(|id| *id == s.id));
+    }
+
+    /// A sensor that the curves of a driven fan use is not present.
+    fn curve_sensor_missing(&self, prof: &Profile) -> bool {
+        self.fans
+            .iter()
+            .filter(|f| f.cfg.enabled && f.controllable())
+            .filter_map(|f| prof.curves.get(&f.cfg.role).or_else(|| prof.curves.get("case")))
+            .flat_map(|c| c.keys())
+            .any(|sid| self.sensor(sid).is_none())
+    }
+
     pub fn sensor(&self, id: &str) -> Option<&Sensor> {
         self.sensors.iter().find(|s| s.id == id)
     }
@@ -260,10 +305,12 @@ impl Core {
             fan.written_pwm = Some(value);
             return Ok(());
         }
-        if fan.written_pwm == Some(value) {
+        let enable = format!("{}_enable", fan.pwm);
+        // Re-check the mode even when the duty is unchanged: firmware can
+        // take a channel back (resume from S3) without anything else changing.
+        if fan.written_pwm == Some(value) && hw.read(&fan.chip, &enable) == Some(1) {
             return Ok(());
         }
-        let enable = format!("{}_enable", fan.pwm);
         let mut new_original = false;
         if fan.original_enable.is_none() {
             // Never hand back "manual": that would leave the fan frozen.
@@ -288,9 +335,9 @@ impl Core {
         let hw = &self.hw;
         let fan = &mut self.fans[idx];
         if let Some(g) = fan.gpu.as_mut() {
-            if fan.written_pwm.is_some()
-                && let Err(e) = g.release()
-            {
+            // Not guarded by written_pwm: a duty the worker is still trying
+            // to send must be cancelled too. A never-driven card is a no-op.
+            if let Err(e) = g.release() {
                 eprintln!("error: could not release {}: {e}", fan.id);
             }
             fan.written_pwm = None;
@@ -325,10 +372,41 @@ impl Core {
 
     // ---- control loop ---------------------------------------------------
 
+    /// The machine was suspended: the Super I/O and the GPU may have dropped
+    /// what we wrote, so write everything again.
+    pub fn on_resume(&mut self) {
+        for fan in &mut self.fans {
+            match &fan.gpu {
+                Some(g) => g.resend(),
+                None => fan.written_pwm = None,
+            }
+        }
+    }
+
+    fn check_resume(&mut self) {
+        let offset = sleep_offset();
+        if let Some(prev) = self.sleep_offset.replace(offset)
+            && offset - prev > 1.0
+        {
+            eprintln!("resumed after {:.0} s suspended: re-applying fan settings", offset - prev);
+            self.on_resume();
+        }
+    }
+
     pub fn tick(&mut self, now: f64) {
+        self.check_resume();
         let dt = self.last_tick.map_or(self.interval, |l| clamp(now - l, 0.05, 10.0));
         self.last_tick = Some(now);
         let prof = self.active_profile();
+        if now - self.last_sensor_scan >= SENSOR_RESCAN_SECONDS && self.curve_sensor_missing(&prof) {
+            self.last_sensor_scan = now;
+            self.hw.rescan();
+            let before = self.sensors.len();
+            self.add_missing_sensors();
+            if self.sensors.len() > before {
+                eprintln!("found sensors: {}", self.sensors.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join(", "));
+            }
+        }
         for s in &mut self.sensors {
             s.update(&self.hw, dt, prof.hysteresis);
         }
@@ -343,6 +421,7 @@ impl Core {
         // Fans being calibrated belong to the calibration thread; every
         // other fan stays on its curve meanwhile.
         let busy: Vec<String> = self.calibration.as_ref().map(|c| c.fans.clone()).unwrap_or_default();
+        let mut alerts = Vec::new();
         for i in 0..self.fans.len() {
             if busy.contains(&self.fans[i].id) {
                 continue;
@@ -363,32 +442,52 @@ impl Core {
                 self.fans[i].reason = format!("write failed: {e}");
                 eprintln!("warning: {}: {e}", self.fans[i].id);
             }
+            let f = &self.fans[i];
+            if f.reason.starts_with("no ") && f.reason.ends_with(" sensor") {
+                alerts.push(format!("{}: {}", f.cfg.label, f.reason));
+            }
         }
+        self.alert = if alerts.is_empty() {
+            String::new()
+        } else {
+            format!("Full speed, {} (driver not loaded?). Rechecked every {SENSOR_RESCAN_SECONDS:.0} s.", alerts.join(", "))
+        };
     }
 
     /// Percent the profile demands for a fan, and which sensor drove it.
-    pub fn fan_target(&self, fan: &Fan, prof: &Profile) -> (f64, String) {
+    ///
+    /// A curve whose sensor this machine lacks (no NVMe, no GPU) is unused,
+    /// but if none of the fan's curves has a sensor the fan has nothing to
+    /// follow, e.g. k10temp not loaded yet: full speed until one appears.
+    pub fn fan_target(&self, fan: &Fan, prof: &Profile) -> Demand {
         let curves = prof.curves.get(&fan.cfg.role).or_else(|| prof.curves.get("case"));
-        let mut best = (0.0, String::new());
+        let mut best = Demand { percent: 0.0, reason: String::new(), emergency: false };
+        let mut found = false;
         for (sid, points) in curves.into_iter().flatten() {
-            let Some(s) = self.sensor(sid) else { continue }; // absent sensor: curve unused
+            let Some(s) = self.sensor(sid) else { continue };
+            found = true;
             if !s.ok {
-                return (100.0, format!("{sid} sensor lost"));
+                return Demand { percent: 100.0, reason: format!("{sid} sensor lost"), emergency: true };
             }
             let value = interp(points, s.held.unwrap_or(0.0));
-            if value >= best.0 {
-                best = (value, sid.clone());
+            if value >= best.percent {
+                (best.percent, best.reason) = (value, sid.clone());
             }
         }
-        best
+        match curves.filter(|c| !found && !c.is_empty()) {
+            Some(c) => {
+                let ids: Vec<&str> = c.keys().map(String::as_str).collect();
+                Demand { percent: 100.0, reason: format!("no {} sensor", ids.join("/")), emergency: true }
+            }
+            None => best,
+        }
     }
 
     fn control_fan(&mut self, i: usize, prof: &Profile, critical: Option<&str>, dt: f64, now: f64) -> std::io::Result<()> {
-        let (mut target, mut reason) = self.fan_target(&self.fans[i], prof);
+        let Demand { percent: mut target, mut reason, mut emergency } = self.fan_target(&self.fans[i], prof);
         if let Some(c) = critical {
-            (target, reason) = (100.0, format!("{c} critical"));
+            (target, reason, emergency) = (100.0, format!("{c} critical"), true);
         }
-        let emergency = critical.is_some() || reason.ends_with("lost");
         let fan = &mut self.fans[i];
         fan.target = target;
         fan.reason = reason;
@@ -443,8 +542,13 @@ impl Core {
             "sensors": self.sensors.iter().map(Sensor::to_json).collect::<Vec<_>>(),
             "fans": self.fans.iter().map(Fan::to_json).collect::<Vec<_>>(),
             "calibration": self.calibration,
-            "message": self.message,
+            "message": self.status_message(),
         })
+    }
+
+    /// Failsafe alert first, then the latest note.
+    fn status_message(&self) -> String {
+        [self.alert.as_str(), self.message.as_str()].into_iter().filter(|m| !m.is_empty()).collect::<Vec<_>>().join(" ")
     }
 
     pub fn write_status(&self) {
@@ -571,6 +675,17 @@ pub struct Daemon {
     core: Arc<Mutex<Core>>,
     stop: Arc<AtomicBool>,
     epoch: Instant,
+    clients: Arc<AtomicUsize>,
+}
+
+/// One socket client slot, given back when the client thread ends (even by
+/// panic).
+struct ClientSlot(Arc<AtomicUsize>);
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Daemon {
@@ -579,6 +694,7 @@ impl Daemon {
             core: Arc::new(Mutex::new(Core::new(paths, interval))),
             stop: Arc::new(AtomicBool::new(false)),
             epoch: Instant::now(),
+            clients: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -630,20 +746,34 @@ impl Daemon {
             }
             _ => fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?,
         }
-        for conn in listener.incoming() {
-            if self.stopping() {
-                break;
+        while !self.stopping() {
+            // Wait with a timeout rather than block in accept(), so a stop
+            // is noticed without another connection arriving.
+            let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd for the duration of the call.
+            if unsafe { libc::poll(&mut pfd, 1, 250) } <= 0 {
+                continue; // timeout or EINTR
             }
-            if let Ok(conn) = conn {
-                let d = self.clone();
-                std::thread::spawn(move || d.client(conn));
+            let Ok((mut conn, _)) = listener.accept() else { continue };
+            if self.clients.fetch_add(1, Ordering::Relaxed) >= MAX_CLIENTS {
+                self.clients.fetch_sub(1, Ordering::Relaxed);
+                let _ = conn.set_write_timeout(Some(Duration::from_millis(200)));
+                let _ = conn.write_all(b"{\"ok\":false,\"error\":\"daemon busy: too many clients\"}\n");
+                continue;
             }
+            let slot = ClientSlot(self.clients.clone());
+            let d = self.clone();
+            std::thread::spawn(move || {
+                let _slot = slot;
+                d.client(conn);
+            });
         }
         Ok(())
     }
 
     fn client(&self, mut conn: UnixStream) {
         let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
         let read = conn.try_clone().and_then(|c| BufReader::new(c).take(65536).read_line(&mut line));
         let reply = match read {
@@ -658,6 +788,26 @@ impl Daemon {
         };
         self.lock().write_status();
         let _ = conn.write_all(format!("{reply}\n").as_bytes());
+    }
+
+    /// A BIOS change (header to Voltage mode) or a driver swap only happens
+    /// across a reboot: re-test PWM-deaf fans once per daemon start. Returns
+    /// false while that has to wait for the CPU sensor (k10temp loading late).
+    pub fn startup_retest(&self) -> bool {
+        {
+            let core = self.lock();
+            if core.state.mode != "curve" || !core.fans.iter().any(|f| f.cfg.enabled && f.connected() && !f.responsive()) {
+                return true;
+            }
+            if core.sensor("cpu").is_none() {
+                return false;
+            }
+        }
+        match calibrate::start_retest(self, None) {
+            Ok(()) => eprintln!("re-testing fans that ignored PWM"),
+            Err(e) => eprintln!("warning: re-test: {e}"),
+        }
+        true
     }
 
     pub fn run(&self) {
@@ -684,16 +834,7 @@ impl Daemon {
         }
         // A BIOS change (header to Voltage mode) or a driver swap only
         // happens across a reboot: check PWM-deaf fans again on every start.
-        let retest = {
-            let core = self.lock();
-            core.state.mode == "curve" && core.fans.iter().any(|f| f.cfg.enabled && f.connected() && !f.responsive())
-        };
-        if retest {
-            match calibrate::start_retest(self, None) {
-                Ok(()) => eprintln!("re-testing fans that ignored PWM"),
-                Err(e) => eprintln!("warning: re-test: {e}"),
-            }
-        }
+        let mut retest_pending = !self.startup_retest();
         let d = self.clone();
         std::thread::spawn(move || {
             if let Err(e) = d.serve() {
@@ -707,6 +848,9 @@ impl Daemon {
                 core.tick(start);
                 core.write_status();
             }
+            if retest_pending {
+                retest_pending = !self.startup_retest();
+            }
             let interval = self.lock().interval;
             // Sleep in short slices so SIGTERM is handled promptly.
             while !self.stopping() && self.now() - start < interval {
@@ -718,6 +862,17 @@ impl Daemon {
         let _ = fs::remove_file(core.paths.socket());
         eprintln!("released fans to firmware control");
     }
+}
+
+/// Seconds the machine has spent suspended since boot.
+fn sleep_offset() -> f64 {
+    let secs = |clock| {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: valid clock id and out-pointer.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+    };
+    secs(libc::CLOCK_BOOTTIME) - secs(libc::CLOCK_MONOTONIC)
 }
 
 /// Hand every PWM channel back to firmware control. Safe to run any time;

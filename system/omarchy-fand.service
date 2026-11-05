@@ -2,6 +2,11 @@
 Description=Omarchy fan curve daemon
 Documentation=file:///usr/local/share/doc/omarchy-fans/README.md
 After=systemd-modules-load.service
+# arc-fan (standalone Arc fan daemon) writes the same GPU fan table.
+Conflicts=arc-fan.service
+# Ordering makes systemd stop arc-fan (whose ExecStopPost restores the stock
+# curve) before starting us, not concurrently. One direction is enough.
+After=arc-fan.service
 
 [Service]
 Type=simple

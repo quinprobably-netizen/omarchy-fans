@@ -174,6 +174,8 @@ struct Rig {
 struct FakePcode {
     log: Arc<Mutex<Vec<(u8, u32)>>>,
     stop: Arc<AtomicBool>,
+    /// While set, PCODE never answers (READY stays set), like a wedged mailbox.
+    hung: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -195,13 +197,14 @@ impl FakePcode {
         assert_ne!(ptr, libc::MAP_FAILED as usize);
         let log = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let hung = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (log, stop) = (log.clone(), stop.clone());
+            let (log, stop, hung) = (log.clone(), stop.clone(), hung.clone());
             thread::spawn(move || {
                 let reg = |off: usize| (ptr + off) as *mut u32;
                 while !stop.load(Ordering::Relaxed) {
                     let mb = unsafe { std::ptr::read_volatile(reg(MAILBOX)) };
-                    if mb & (1 << 31) != 0 {
+                    if mb & (1 << 31) != 0 && !hung.load(Ordering::Relaxed) {
                         let data0 = unsafe { std::ptr::read_volatile(reg(MAILBOX + 4)) };
                         if mb & 0xff == 0x7d {
                             log.lock().unwrap().push((((mb >> 8) & 0xff) as u8, data0));
@@ -215,7 +218,7 @@ impl FakePcode {
                 unsafe { libc::munmap(ptr as *mut libc::c_void, 16 << 20) };
             })
         };
-        FakePcode { log, stop, thread: Some(thread) }
+        FakePcode { log, stop, hung, thread: Some(thread) }
     }
 
     fn log(&self) -> Vec<(u8, u32)> {
@@ -256,7 +259,13 @@ impl Rig {
     }
 
     fn build(gpu: bool) -> Self {
+        Self::build_with(gpu, |_| {})
+    }
+
+    /// `prep` runs on the fake hardware before the daemon starts.
+    fn build_with(gpu: bool, prep: impl FnOnce(&FakeHw)) -> Self {
         let hw = FakeHw::new();
+        prep(&hw);
         let paths = Paths {
             sysfs: hw.root.clone(),
             run_dir: hw.root.join("run"),
@@ -276,7 +285,17 @@ impl Rig {
         for k in 0..n {
             self.d.tick(start + k as f64);
         }
+        self.settle_gpu();
         start + n as f64
+    }
+
+    /// Wait for GPU fan workers to put the newest duty on the card.
+    fn settle_gpu(&self) {
+        for f in &self.d.lock().fans {
+            if let Some(g) = &f.gpu {
+                assert!(g.settle(Duration::from_secs(5)), "GPU fan worker did not settle");
+            }
+        }
     }
 
     fn fan<T>(&self, i: usize, f: impl FnOnce(&omarchy_fans::fan::Fan) -> T) -> T {
@@ -420,6 +439,66 @@ fn lost_sensor_fails_safe() {
 }
 
 #[test]
+fn sensor_missing_at_start_fails_safe_until_it_appears() {
+    // k10temp not loaded yet when the daemon starts.
+    let tctl = |hw: &FakeHw| hw.k10.join("temp1_input");
+    let rig = Rig::build_with(false, |hw| fs::remove_file(tctl(hw)).unwrap());
+    assert!(rig.d.lock().sensor("cpu").is_none());
+    let t = rig.ticks(3, 1000.0);
+    assert_eq!(rig.hw.pwm(1), 255, "CPU fan has no sensor to follow");
+    assert!(rig.fan(0, |f| f.reason == "no cpu sensor"), "{}", rig.fan(0, |f| f.reason.clone()));
+    // Case fans still follow the GPU curve, which has a sensor.
+    assert!(rig.fan(1, |f| f.reason == "gpu"));
+
+    // The module loads: the daemon picks the sensor up and leaves failsafe.
+    let err = rig.cmd(json!({"cmd": "calibrate"})).unwrap_err();
+    assert!(err.contains("no CPU temperature sensor"), "{err}");
+    let status = rig.d.lock().status();
+    assert!(status["message"].as_str().unwrap().contains("CPU fan: no cpu sensor"), "{status}");
+
+    w(&tctl(&rig.hw), 45000);
+    rig.ticks(40, t);
+    assert!(rig.d.lock().sensor("cpu").is_some(), "sensor found on rescan");
+    assert!(rig.fan(0, |f| f.reason == "cpu"));
+    assert!(rig.hw.pwm(1) < 200, "back on its curve: {}", rig.hw.pwm(1));
+    assert_eq!(rig.d.lock().status()["message"], "", "alert cleared");
+}
+
+#[test]
+fn startup_retest_waits_for_the_cpu_sensor() {
+    let tctl = |hw: &FakeHw| hw.k10.join("temp1_input");
+    let rig = Rig::build_with(false, |hw| fs::remove_file(tctl(hw)).unwrap());
+    // pwm4 was found ignoring PWM on an earlier boot.
+    rig.d.lock().fans[3].cfg.calibration = Some(omarchy_fans::fan::Calibration {
+        connected: true,
+        responsive: false,
+        max_rpm: 1150,
+        ..Default::default()
+    });
+    assert!(!rig.d.startup_retest(), "must wait: no CPU sensor to abort on");
+    assert!(rig.d.lock().calibration.is_none());
+    w(&tctl(&rig.hw), 45000);
+    rig.ticks(15, 1000.0);
+    assert!(rig.d.startup_retest());
+    let cal = rig.d.lock().calibration.as_ref().map(|c| (c.kind.clone(), c.fans.clone()));
+    assert_eq!(cal, Some(("retest".into(), vec!["it8689/pwm4".to_string()])));
+}
+
+#[test]
+fn firmware_taking_a_channel_back_is_reverted() {
+    // e.g. the Super I/O comes back from S3 in automatic mode; the target
+    // duty is unchanged, so only the mode check notices.
+    let rig = Rig::new();
+    let t = rig.ticks(5, 1000.0);
+    assert_eq!(rig.hw.enable(1), 1);
+    let pwm = rig.hw.pwm(1);
+    w(&rig.hw.it.join("pwm1_enable"), 2);
+    w(&rig.hw.it.join("pwm1"), 255);
+    rig.ticks(1, t);
+    assert_eq!((rig.hw.enable(1), rig.hw.pwm(1)), (1, pwm));
+}
+
+#[test]
 fn auto_mode_releases_to_firmware() {
     let rig = Rig::new();
     let t = rig.ticks(3, 1000.0);
@@ -505,6 +584,51 @@ fn socket_roundtrip() {
     assert_eq!(status["fans"].as_array().unwrap().len(), 5);
 }
 
+fn wait_for_socket(rig: &Rig) -> std::path::PathBuf {
+    let sock = rig.paths.socket();
+    for _ in 0..200 {
+        if sock.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    sock
+}
+
+fn request(sock: &Path, req: &str) -> Value {
+    let mut s = UnixStream::connect(sock).unwrap();
+    s.write_all(format!("{req}\n").as_bytes()).unwrap();
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn socket_caps_clients_and_serve_stops() {
+    let rig = Rig::new();
+    let d = rig.d.clone();
+    let server = thread::spawn(move || d.serve());
+    let sock = wait_for_socket(&rig);
+    // Clients that connect and never send hold a thread each.
+    let idle: Vec<UnixStream> = (0..omarchy_fans::daemon::MAX_CLIENTS).map(|_| UnixStream::connect(&sock).unwrap()).collect();
+    let reply = request(&sock, r#"{"cmd":"status"}"#);
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(reply["error"].as_str().unwrap().contains("busy"), "{reply}");
+    drop(idle);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while request(&sock, r#"{"cmd":"status"}"#)["ok"] != true {
+        assert!(Instant::now() < deadline, "slots freed when idle clients hang up");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // serve() notices a stop without needing another connection.
+    rig.d.request_stop();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !server.is_finished() {
+        assert!(Instant::now() < deadline, "serve() did not return after stop");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ---- calibration ----------------------------------------------------------
 
 #[test]
@@ -587,7 +711,11 @@ fn calibration_aborts_when_hot() {
 #[test]
 fn empty_headers_never_flag_stall() {
     let rig = Rig::new();
-    rig.ticks(20, 1000.0);
+    for k in 0..20 {
+        rig.d.tick(1000.0 + k as f64);
+        // Give the fan simulator (2 ms cycle) time to answer each write.
+        thread::sleep(Duration::from_millis(5));
+    }
     assert!(rig.fan(0, |f| f.seen_spinning));
     assert!(!rig.fan(4, |f| f.seen_spinning || f.stalled), "empty header pwm5 must not report a stall");
 }
@@ -736,6 +864,66 @@ fn restore_resets_gpu_to_stock() {
     rig.ticks(3, 1000.0);
     restore(&rig.paths);
     assert_eq!(rig.pcode.as_ref().unwrap().last_table(), Some(None));
+}
+
+#[test]
+fn hung_gpu_mailbox_does_not_stall_the_control_loop() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(60.0);
+    let t = rig.ticks(3, 1000.0);
+    let pcode = rig.pcode.as_ref().unwrap();
+    pcode.hung.store(true, Ordering::Relaxed);
+    rig.hw.gpu(90.0); // new duty: the worker starts a transaction that hangs
+    let mut t = t;
+    for _ in 0..30 {
+        let start = Instant::now();
+        rig.d.tick(t);
+        assert!(start.elapsed() < Duration::from_millis(100), "tick blocked {:?}", start.elapsed());
+        // Other fans are still driven meanwhile.
+        rig.cmd(json!({"cmd": "status"})).unwrap();
+        t += 1.0;
+        thread::sleep(Duration::from_millis(50));
+    }
+    let gpu = rig.d.lock().fans.len() - 1;
+    assert!(rig.fan(gpu, |f| f.reason.starts_with("write failed")), "{}", rig.fan(gpu, |f| f.reason.clone()));
+    // PCODE answers again: the worker catches up with the newest duty.
+    pcode.hung.store(false, Ordering::Relaxed);
+    rig.ticks(1, t);
+    assert!(pcode.last_table().unwrap().unwrap() >= 90);
+}
+
+#[test]
+fn release_wins_over_a_duty_that_never_reached_the_card() {
+    let rig = Rig::with_gpu();
+    let pcode = rig.pcode.as_ref().unwrap();
+    pcode.hung.store(true, Ordering::Relaxed);
+    rig.hw.gpu(80.0);
+    rig.d.tick(1000.0);
+    // Release gives up after its wait but must not block the daemon forever.
+    let start = Instant::now();
+    rig.cmd(json!({"cmd": "mode", "mode": "auto"})).unwrap();
+    assert!(start.elapsed() < Duration::from_secs(6), "{:?}", start.elapsed());
+    // Back to curves while writes still fail, then auto again.
+    rig.cmd(json!({"cmd": "mode", "mode": "curve"})).unwrap();
+    rig.d.tick(1001.0);
+    rig.cmd(json!({"cmd": "mode", "mode": "auto"})).unwrap();
+    // PCODE recovers: the card must end on the stock curve, not a duty.
+    pcode.hung.store(false, Ordering::Relaxed);
+    rig.settle_gpu();
+    assert_eq!(pcode.last_table(), Some(None), "stock curve after release");
+}
+
+#[test]
+fn resume_resends_gpu_table() {
+    let rig = Rig::with_gpu();
+    rig.hw.gpu(80.0);
+    let t = rig.ticks(3, 1000.0);
+    let before = rig.pcode.as_ref().unwrap().log().len();
+    rig.ticks(1, t);
+    assert_eq!(rig.pcode.as_ref().unwrap().log().len(), before, "unchanged duty is not re-sent");
+    rig.d.lock().on_resume();
+    rig.ticks(1, t + 1.0);
+    assert!(rig.pcode.as_ref().unwrap().log().len() > before, "re-sent after resume");
 }
 
 #[test]

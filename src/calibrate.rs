@@ -50,6 +50,10 @@ fn begin(d: &Daemon, ids: Option<&[String]>, kind: &str, pick: impl Fn(&Fan) -> 
     if core.calibration.is_some() {
         return Err("calibration already running".into());
     }
+    // The run aborts when the CPU gets hot; without a sensor it could not.
+    if core.sensor("cpu").is_none() {
+        return Err("no CPU temperature sensor: calibration could not stop if the CPU got hot".into());
+    }
     let idxs: Vec<usize> = (0..core.fans.len())
         .filter(|&i| {
             let f = &core.fans[i];

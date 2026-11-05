@@ -70,9 +70,26 @@ impl Hwmon {
             })
             .collect();
         found.sort();
+        // A chip seen before keeps its key, so a rescan while running (a
+        // driver loaded late) never moves fans or sensors onto another chip.
+        let previous: BTreeMap<(PathBuf, PathBuf), String> = self
+            .chips
+            .iter()
+            .filter_map(|(k, p)| Some(((p.clone(), self.devices.get(k)?.clone()), k.clone())))
+            .collect();
         self.chips.clear();
         self.devices.clear();
+        let mut fresh = Vec::new();
         for (name, dev, path) in found {
+            match previous.get(&(path.clone(), dev.clone())) {
+                Some(key) if base_name(key) == name => {
+                    self.devices.insert(key.clone(), dev);
+                    self.chips.insert(key.clone(), path);
+                }
+                _ => fresh.push((name, dev, path)),
+            }
+        }
+        for (name, dev, path) in fresh {
             let mut key = name.clone();
             let mut n = 2;
             while self.chips.contains_key(&key) {
