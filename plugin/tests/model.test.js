@@ -115,5 +115,5 @@ test("GPU fan is listed at rest and gets its own curve tab", () => {
   }
   assert.deepEqual(M.connectedFans(st).map(f => f.id), ["it/pwm1", "xe/gpu"])
   assert.deepEqual(M.curveTabs(st).map(t => t.label), ["CPU fan", "GPU fan", "GPU ← VRAM"])
-  assert.equal(M.fanTag(st.fans[1]), "card")
+  assert.equal(M.fanTag(st.fans[1]), "", "the name already says GPU")
 })

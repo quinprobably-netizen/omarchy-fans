@@ -161,7 +161,7 @@ function ignoresPwm(f) {
 
 function fanTag(f) {
   if (ignoresPwm(f)) return "ignores PWM · BIOS"
-  if (f && f.kind === "gpu") return "card"
+  if (f && f.kind === "gpu") return ""
   return f && f.connected && !f.calibrated ? "uncalibrated" : ""
 }
 

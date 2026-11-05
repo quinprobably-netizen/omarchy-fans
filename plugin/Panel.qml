@@ -342,14 +342,15 @@ Panel {
               readonly property bool deaf: Model.ignoresPwm(modelData)
               readonly property bool retesting: Model.retestRunning(root.status, modelData.id)
               width: parent.width
-              implicitHeight: Math.max(fanName.implicitHeight, retestButton.visible ? retestButton.implicitHeight : 0)
-                + (fanHint.visible ? Style.space(2) + fanHint.implicitHeight : 0)
-                + Style.space(4) + Style.space(6)
+              // name/rpm line, then the speed bar, then (PWM-deaf fans) the fix hint
+              readonly property real headerHeight: Math.max(fanName.implicitHeight, retestButton.visible ? retestButton.implicitHeight : 0)
+              implicitHeight: headerHeight + Style.space(4) + track.height
+                + (fanHint.visible ? Style.spacing.labelGap + fanHint.implicitHeight : 0)
 
               Text {
                 id: fanName
                 textFormat: Text.PlainText
-                text: modelData.label + (Model.fanTag(modelData) !== "" ? "  ·  " + Model.fanTag(modelData) : "")
+                text: modelData.label + (Model.fanTag(modelData) !== "" ? " · " + Model.fanTag(modelData) : "")
                 color: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -397,8 +398,8 @@ Panel {
                 visible: fanRow.deaf
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.top: retestButton.bottom
-                anchors.topMargin: Style.space(2)
+                anchors.top: track.bottom
+                anchors.topMargin: Style.spacing.labelGap
                 wrapMode: Text.Wrap
                 textFormat: Text.PlainText
                 text: Model.fanHint(modelData)
@@ -410,7 +411,8 @@ Panel {
                 id: track
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.bottom: parent.bottom
+                anchors.top: parent.top
+                anchors.topMargin: fanRow.headerHeight + Style.space(4)
                 height: Style.space(5)
                 radius: height / 2
                 color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.12)
@@ -464,19 +466,45 @@ Panel {
 
             Repeater {
               model: root.profiles
+              // Five profiles don't fit icon + label side by side in a
+              // ~85 px cell ("Performance" overflowed), so stack them.
               Button {
+                id: profileButton
                 required property var modelData
                 required property int index
                 width: profileRow.cellWidth
-                iconText: Model.PROFILE_ICONS[modelData.id] || "󰈐"
-                iconSize: Style.font.title
-                text: modelData.label
-                fontSize: Style.font.caption
+                implicitHeight: profileStack.implicitHeight + (Style.spacing.controlPaddingY + Style.space(2)) * 2
+                horizontalPadding: Style.spacing.sm
+                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
                 foreground: root.fg
                 fontFamily: root.fontFamily
-                horizontalPadding: Style.space(4)
-                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
                 bordered: true
+
+                Column {
+                  id: profileStack
+                  anchors.centerIn: parent
+                  width: parent.width - profileButton.horizontalPadding * 2
+                  spacing: Style.spacing.xxs
+                  Text {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    textFormat: Text.PlainText
+                    text: Model.PROFILE_ICONS[profileButton.modelData.id] || "󰈐"
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.title
+                  }
+                  Text {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: profileButton.modelData.label
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
                 active: !root.biosMode && root.status && root.status.profile === modelData.id
                 hasCursor: root.cursorActive && root.profileIndex === index
                 onClicked: root.setProfile(modelData.id)
