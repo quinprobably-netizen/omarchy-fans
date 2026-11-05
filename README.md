@@ -27,7 +27,7 @@ It does not enable the service if no PWM fans are detected.
 
 ### Gigabyte boards: fans that ignore PWM
 
-On this B650M D3HP the mainline `it87` driver binds the IT8689E (rev 2) and accepts PWM writes, but the fans don't follow them. Gigabyte's firmware programs extra SmartFan "vectors" in register banks 2 and 3. These keep driving the fans from temperature even when a channel is in manual mode. Calibration detects this: an affected fan is marked **BIOS (driver can't steer)** and left to the firmware.
+On this B650M D3HP the mainline `it87` driver binds the IT8689E (rev 2) and accepts PWM writes, but the fans don't follow them. Gigabyte's firmware programs extra SmartFan "vectors" in register banks 2 and 3. These keep driving the fans from temperature even when a channel is in manual mode. Calibration detects this: an affected fan is marked **BIOS (ignores PWM)** and left to the firmware.
 
 Fix it with the out-of-tree driver, which disables those vectors and uses MMIO:
 
@@ -40,6 +40,12 @@ Measured with mainline it87, duty 255 down to 0:
 - CPU fan: 1128–1247 RPM, tracking CPU temperature
 - System fan 1: flat at ~1149 RPM
 - System fan 2: 1175 RPM, then 864 RPM at duty 205 and below
+
+With frankcrawford/it87, the CPU fan (438–1650 RPM) and System fan 2 (0–1580 RPM) follow PWM.
+
+### 3-pin fans
+
+A 3-pin fan has no PWM wire, so on a header in PWM mode it runs at full voltage whatever the duty (System fan 1 here: flat ~1120–1160 RPM even with the DKMS driver). `it87` has no sysfs switch for the header's DC mode. Set the header to **Voltage** mode in the BIOS (Smart Fan 6, per header "Fan Control Mode"), boot, then `omarchy-fans calibrate`. The duty register then sets the output voltage instead.
 
 ## How the curves are optimised
 

@@ -344,7 +344,7 @@ Panel {
               Text {
                 id: fanName
                 textFormat: Text.PlainText
-                text: modelData.label + (modelData.responsive === false ? "  ·  BIOS (driver can't steer)"
+                text: modelData.label + (modelData.responsive === false ? "  ·  BIOS (ignores PWM)"
                   : (modelData.calibrated ? "" : "  ·  uncalibrated"))
                 color: root.fg
                 font.family: root.fontFamily
